@@ -1,0 +1,16 @@
+tests/test_client_payloads.py
+  h_0cc3b7d7475c37 36-47
+web/index.html
+  h_0cc3b7d7475c37 632-642,1267-1270,1276,1431
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.24",
+  "base_commit_sha": "b432d0bad83a5f4fb3ea32e8ff629050b7685125",
+  "prompts": {},
+  "humans": {
+    "h_0cc3b7d7475c37": {
+      "author": "eleanor.zhu <eleanore.zhu@gmail.com>"
+    }
+  }
+}
