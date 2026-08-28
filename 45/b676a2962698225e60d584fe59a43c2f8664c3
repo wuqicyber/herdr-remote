@@ -1,0 +1,21 @@
+tests/test_client_payloads.py
+  s_fc5250a0c29722::t_c5a0208acd4f30 1,25-35
+web/index.html
+  s_fc5250a0c29722::t_475f77ca200a23 1412-1422
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.24",
+  "base_commit_sha": "45b676a2962698225e60d584fe59a43c2f8664c3",
+  "prompts": {},
+  "sessions": {
+    "s_fc5250a0c29722": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3b16f093-e965-4584-9a6a-9bbb104d2a9d",
+        "model": "unknown"
+      },
+      "human_author": "eleanor.zhu <eleanore.zhu@gmail.com>"
+    }
+  }
+}
