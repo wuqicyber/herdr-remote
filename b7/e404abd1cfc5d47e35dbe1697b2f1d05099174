@@ -1,0 +1,21 @@
+relay/herdr_relay.py
+  s_9a40cf753f11a1::t_69c972f560f44e 7,597-670,1379,1381-1385
+tests/test_herdr_relay.py
+  s_9a40cf753f11a1::t_6dddf031340d84 1561-1662
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.24",
+  "base_commit_sha": "b7e404abd1cfc5d47e35dbe1697b2f1d05099174",
+  "prompts": {},
+  "sessions": {
+    "s_9a40cf753f11a1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f6fa3fbb-3c60-4da9-a8f0-79140081e11b",
+        "model": "claude-opus-5"
+      },
+      "human_author": "eleanor.zhu <eleanore.zhu@gmail.com>"
+    }
+  }
+}
