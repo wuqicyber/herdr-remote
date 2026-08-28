@@ -1,0 +1,19 @@
+web/index.html
+  s_9a40cf753f11a1::t_b1c0fb0d75c90d 40-44,62-66,132,153,372
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.24",
+  "base_commit_sha": "299c9ecf824708bc1fc1004ba3bd283bd9a581fc",
+  "prompts": {},
+  "sessions": {
+    "s_9a40cf753f11a1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f6fa3fbb-3c60-4da9-a8f0-79140081e11b",
+        "model": "unknown"
+      },
+      "human_author": "eleanor.zhu <eleanore.zhu@gmail.com>"
+    }
+  }
+}
