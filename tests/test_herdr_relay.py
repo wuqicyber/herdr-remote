@@ -1,3 +1,4 @@
+import ast
 import asyncio
 import importlib.util
 import json
@@ -9,6 +10,7 @@ import shutil
 import sys
 import tempfile
 import threading
+import time
 import types
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -43,7 +45,8 @@ def _websockets_stubs():
 
 
 @contextmanager
-def loaded_relay(*, herdr_bin=None, relay_host=None, relay_token=None, trusted_origins=None):
+def loaded_relay(*, herdr_bin=None, relay_host=None, relay_token=None, trusted_origins=None,
+                 shell_panes=None):
     module_name = f"herdr_relay_test_{uuid.uuid4().hex}"
     logger = logging.getLogger("herdr-relay")
     original_handlers = tuple(logger.handlers)
@@ -66,6 +69,8 @@ def loaded_relay(*, herdr_bin=None, relay_host=None, relay_token=None, trusted_o
             environment["HERDR_RELAY_TOKEN"] = relay_token
         if trusted_origins is not None:
             environment["HERDR_TRUSTED_ORIGINS"] = trusted_origins
+        if shell_panes is not None:
+            environment["HERDR_SHELL_PANES"] = shell_panes
 
         with mock.patch.dict(os.environ, environment, clear=False), mock.patch.dict(
             sys.modules, _websockets_stubs(), clear=False
@@ -75,6 +80,7 @@ def loaded_relay(*, herdr_bin=None, relay_host=None, relay_token=None, trusted_o
                 ("HERDR_RELAY_HOST", relay_host),
                 ("HERDR_RELAY_TOKEN", relay_token),
                 ("HERDR_TRUSTED_ORIGINS", trusted_origins),
+                ("HERDR_SHELL_PANES", shell_panes),
             ):
                 if value is None:
                     os.environ.pop(name, None)
@@ -180,10 +186,239 @@ class RelayPaneStateTests(unittest.TestCase):
             # poll rather than keeping whatever was cached previously.
             self.assertNotIn("stale-pane", relay.agent_cache)
             self.assertNotIn("stale-pane", relay.known_panes)
-            self.assertEqual(
-                relay.agent_cache,
-                {"active-pane": {"pane_id": "active-pane", "remote": None}},
-            )
+            self.assertEqual(list(relay.agent_cache), ["active-pane"])
+            # `project: current` is gone -- the point of the assertion. The two activity stamps are
+            # added by the same call (stamp_activity) and are asserted where they belong.
+            cached = dict(relay.agent_cache["active-pane"])
+            for stamp in ("last_active_at", "last_seen_at"):
+                cached.pop(stamp, None)
+            self.assertEqual(cached, {"pane_id": "active-pane", "remote": None})
+
+
+class _Clock:
+    """A hand-cranked wall clock. The ledger's whole meaning is `active_at > seen_at`, so a test of
+    it that races the real clock would be a test of the clock's resolution."""
+
+    def __init__(self, start=1_700_000_000.0):
+        self.now = start
+
+    def time(self):
+        return self.now
+
+    def tick(self, seconds=1.0):
+        self.now += seconds
+        return self.now
+
+
+@contextmanager
+def frozen_clock(relay, start=1_700_000_000.0):
+    clock = _Clock(start)
+    stub = types.SimpleNamespace(time=clock.time, monotonic=time.monotonic, sleep=time.sleep)
+    with mock.patch.object(relay, "time", stub):
+        yield clock
+
+
+def relay_seen_on():
+    with loaded_relay() as relay:
+        return relay.SEEN_ON
+
+
+def _pane(pane_id, host="local", **extra):
+    return {"pane_id": pane_id, "host": host, "remote": None if host == "local" else host, **extra}
+
+
+class RelayActivityLedgerTests(unittest.TestCase):
+    """The two timestamps a client needs to say "this finished while you weren't looking".
+
+    herdr reports neither, so the relay owns both, and every rule here is one that decides whether
+    a phone opens on a useful column or on a screen of false alerts.
+    """
+
+    def test_a_pane_starts_out_seen(self):
+        """A first sighting seeds active_at == seen_at, so nothing is unread on a fresh relay. The
+        alternative is that every client's first connection is a wall of alerts for work it has
+        already looked at at the desk."""
+        with loaded_relay() as relay, frozen_clock(relay):
+            relay.update_pane_maps([_pane("w1:p1", status="done")], [])
+            entry = relay.pane_activity[("local", "w1:p1")]
+            self.assertEqual(entry["active_at"], entry["seen_at"])
+
+    def test_a_pane_first_seen_as_done_is_not_unread(self):
+        """The same rule stated the way it will be read: only transitions observed AFTER the relay
+        first saw a pane may mark it unread -- which is what the blocked-push path already does by
+        never firing on a first sighting."""
+        with loaded_relay() as relay, frozen_clock(relay) as clock:
+            agents = [_pane("w1:p1", status="done")]
+            relay.update_pane_maps(agents, [])
+            clock.tick(60)
+            relay.update_pane_maps([_pane("w1:p1", status="done")], [])
+            entry = relay.pane_activity[("local", "w1:p1")]
+            self.assertEqual(entry["active_at"], entry["seen_at"],
+                             "a pane that never moved was marked unread")
+
+    def test_a_status_change_is_the_only_thing_that_marks_a_pane_unread(self):
+        with loaded_relay() as relay, frozen_clock(relay) as clock:
+            relay.update_pane_maps([_pane("w1:p1", status="working")], [])
+            clock.tick(30)
+            relay.update_pane_maps([_pane("w1:p1", status="done")], [])
+            entry = relay.pane_activity[("local", "w1:p1")]
+            self.assertGreater(entry["active_at"], entry["seen_at"])
+
+    def test_looking_at_a_pane_clears_it(self):
+        """seen_at = now, and the row leaves the section on its own -- nothing to mark read."""
+        with loaded_relay() as relay, frozen_clock(relay) as clock:
+            relay.update_pane_maps([_pane("w1:p1", status="working")], [])
+            clock.tick(30)
+            relay.update_pane_maps([_pane("w1:p1", status="done")], [])
+            clock.tick(5)
+            relay.activity_note_seen("w1:p1")
+            entry = relay.pane_activity[("local", "w1:p1")]
+            self.assertGreater(entry["seen_at"], entry["active_at"])
+
+    def test_only_the_messages_that_mean_you_looked_clear_it(self):
+        """`focus` moves herdr's own cursor at the desk without the client reading anything, and the
+        tab/workspace verbs name no pane at all."""
+        self.assertLessEqual(
+            {"read_pane", "get_history", "respond", "send_keys", "send_text", "agent_prompt"},
+            set(relay_seen_on()))
+        for absent in ("focus", "create_tab", "rename_tab", "close_tab", "rename_agent",
+                       "push_subscribe", "push_unsubscribe", "agents"):
+            self.assertNotIn(absent, relay_seen_on())
+
+    def test_an_unknown_pane_cannot_grow_the_ledger(self):
+        """Otherwise a client naming bogus ids writes one durable entry per id."""
+        with loaded_relay() as relay, frozen_clock(relay):
+            relay.activity_note_seen("nobody:p9")
+            self.assertEqual(relay.pane_activity, {})
+
+    def test_a_gone_pane_is_forgotten_so_a_reused_id_starts_clean(self):
+        with loaded_relay() as relay, frozen_clock(relay) as clock:
+            relay.update_pane_maps([_pane("w1:p1", status="working")], [_pane("w1:p2")])
+            clock.tick(30)
+            relay.update_pane_maps([_pane("w1:p1", status="working")], [_pane("w1:p3")])
+            self.assertNotIn(("local", "w1:p2"), relay.pane_activity,
+                             "a closed pane kept its history for the next pane to inherit")
+            self.assertIn(("local", "w1:p3"), relay.pane_activity)
+
+    def test_shell_panes_are_in_the_ledger_too(self):
+        """The reason this hangs off the pane sweep rather than a status-transition listener: a
+        removal event derived from an agent status map never fires for a pane with no agent."""
+        with loaded_relay() as relay, frozen_clock(relay):
+            relay.update_pane_maps([], [_pane("w1:p2"), _pane("w1:p5")])
+            self.assertEqual(sorted(k[1] for k in relay.pane_activity), ["w1:p2", "w1:p5"])
+
+    def test_the_same_pane_id_on_two_hosts_is_two_panes(self):
+        """Every herdr numbers its own panes, and this is the one map that reaches disk -- where a
+        collision would stick."""
+        with loaded_relay() as relay, frozen_clock(relay) as clock:
+            relay.update_pane_maps(
+                [_pane("w1:p1", status="working"), _pane("w1:p1", host="gpu", status="working")], [])
+            clock.tick(30)
+            relay.update_pane_maps(
+                [_pane("w1:p1", status="done"), _pane("w1:p1", host="gpu", status="working")], [])
+            local = relay.pane_activity[("local", "w1:p1")]
+            gpu = relay.pane_activity[("gpu", "w1:p1")]
+            self.assertGreater(local["active_at"], local["seen_at"])
+            self.assertEqual(gpu["active_at"], gpu["seen_at"],
+                             "a transition on one host marked the other host's pane unread")
+
+    def test_the_stamps_go_out_in_milliseconds(self):
+        """Every client that will compare them is JavaScript; it should not have to know which unit
+        this relay thinks in."""
+        with loaded_relay() as relay, frozen_clock(relay, start=1_700_000_000.5):
+            agents = [_pane("w1:p1", status="idle")]
+            shells = [_pane("w1:p2")]
+            relay.update_pane_maps(agents, shells)
+            for record in (agents[0], shells[0]):
+                self.assertEqual(record["last_active_at"], 1_700_000_000_500)
+                self.assertEqual(record["last_seen_at"], 1_700_000_000_500)
+
+    def test_a_pane_with_no_entry_carries_neither_stamp(self):
+        """Both absent must read as "nothing known", which is how a client older than this file --
+        and this relay before it -- keeps working."""
+        with loaded_relay() as relay:
+            records = [_pane("w9:p9")]
+            relay.stamp_activity(records)
+            self.assertNotIn("last_active_at", records[0])
+            self.assertNotIn("last_seen_at", records[0])
+
+
+class RelayActivityPersistenceTests(unittest.TestCase):
+    def test_a_write_survives_a_reload(self):
+        with loaded_relay() as relay, frozen_clock(relay, start=1_700_000_000.0):
+            relay.update_pane_maps([_pane("w1:p1", status="idle")], [])
+            relay._write_activity()
+            relay.pane_activity = {}
+            relay._load_activity()
+            self.assertEqual(relay.pane_activity,
+                             {("local", "w1:p1"): {"active_at": 1_700_000_000.0,
+                                                   "seen_at": 1_700_000_000.0}})
+
+    def test_the_write_is_atomic(self):
+        """A crash mid-write must not leave a half file that then fails to parse and silently costs
+        everyone's unread column."""
+        with loaded_relay() as relay, frozen_clock(relay):
+            relay.update_pane_maps([_pane("w1:p1", status="idle")], [])
+            relay._write_activity()
+            self.assertTrue(os.path.isfile(relay.ACTIVITY_FILE))
+            self.assertFalse(os.path.isfile(relay.ACTIVITY_FILE + ".tmp"),
+                             "the temp file was left behind, so the rename did not happen")
+
+    def test_load_drops_what_it_cannot_trust(self):
+        """This file outlives the process that wrote it: a shape change, a truncated write or a
+        hand-edit costs the unread column, not the relay's startup. `True` is an int in python and
+        as a timestamp would sort a pane unread forever."""
+        with loaded_relay() as relay, frozen_clock(relay, start=1_700_000_000.0):
+            with open(relay.ACTIVITY_FILE, "w") as f:
+                json.dump({
+                    "local": {
+                        "good": {"active_at": 1_699_999_999.0, "seen_at": 1_699_999_999.0},
+                        "bool": {"active_at": True, "seen_at": True},
+                        "text": {"active_at": "now", "seen_at": 1.0},
+                        "half": {"active_at": 1.0},
+                        "notdict": 5,
+                        "ancient": {"active_at": 1.0, "seen_at": 1.0},
+                    },
+                    "notdict": 7,
+                }, f)
+            relay.pane_activity = {}
+            relay._load_activity()
+            self.assertEqual(list(relay.pane_activity), [("local", "good")])
+
+    def test_an_unreadable_file_is_not_fatal(self):
+        with loaded_relay() as relay:
+            with open(relay.ACTIVITY_FILE, "w") as f:
+                f.write("{ this is not json")
+            relay.pane_activity = {"sentinel": 1}
+            relay._load_activity()
+            self.assertEqual(relay.pane_activity, {"sentinel": 1},
+                             "a corrupt ledger replaced the in-memory one")
+
+    def test_writes_are_debounced(self):
+        """An open pane's mirror tick marks it seen every 3s. In memory that is free; on disk it
+        would be one write per tick, forever."""
+        async def scenario():
+            with loaded_relay() as relay, frozen_clock(relay):
+                writes = []
+                with mock.patch.object(relay, "_write_activity", side_effect=lambda: writes.append(1)):
+                    relay.update_pane_maps([_pane("w1:p1", status="idle")], [])
+                    for _ in range(20):
+                        relay.activity_note_seen("w1:p1")
+                    await asyncio.sleep(0)
+                    self.assertEqual(writes, [], "the ledger wrote before the debounce elapsed")
+                    self.assertIsNotNone(relay._activity_flush_task)
+                    await relay.flush_activity()
+                    self.assertEqual(writes, [1], "21 changes cost more than one write")
+                    relay._activity_flush_task.cancel()
+        asyncio.run(scenario())
+
+    def test_flush_with_nothing_pending_writes_nothing(self):
+        async def scenario():
+            with loaded_relay() as relay:
+                with mock.patch.object(relay, "_write_activity") as write:
+                    await relay.flush_activity()
+                    write.assert_not_called()
+        asyncio.run(scenario())
 
     @staticmethod
     def _pane_list(label=None):
@@ -494,7 +729,7 @@ class RelaySessionSwitchTests(unittest.TestCase):
             async def switch_mid_broadcast(_message):
                 relay.reset_pane_state()          # simulates a switch landing
 
-            with mock.patch.object(relay, "get_all_agents", return_value=agents), \
+            with mock.patch.object(relay, "get_all_panes", return_value=(agents, [])), \
                  mock.patch.object(relay, "broadcast", side_effect=switch_mid_broadcast):
                 asyncio.run(relay._poll_once())
 
@@ -521,7 +756,7 @@ class RelaySessionSwitchTests(unittest.TestCase):
                 if calls["blocked_broadcasts"] == 1:
                     relay.reset_pane_state()          # simulates a switch landing
 
-            with mock.patch.object(relay, "get_all_agents", return_value=agents), \
+            with mock.patch.object(relay, "get_all_panes", return_value=(agents, [])), \
                  mock.patch.object(relay, "read_pane", return_value="Deploy to prod?"), \
                  mock.patch.object(relay, "broadcast", side_effect=switch_on_first_blocked_broadcast), \
                  mock.patch.object(relay, "send_web_push", new=mock.AsyncMock()):
@@ -543,7 +778,7 @@ class RelaySessionSwitchTests(unittest.TestCase):
             async def switch_mid_clear_push(*args, **kwargs):
                 relay.reset_pane_state()          # simulates a switch landing
 
-            with mock.patch.object(relay, "get_all_agents", return_value=agents), \
+            with mock.patch.object(relay, "get_all_panes", return_value=(agents, [])), \
                  mock.patch.object(relay, "broadcast", new=mock.AsyncMock()), \
                  mock.patch.object(relay, "send_web_push", side_effect=switch_mid_clear_push):
                 asyncio.run(relay._poll_once())
@@ -574,7 +809,7 @@ class RelaySessionSwitchTests(unittest.TestCase):
                         relay.reset_pane_state()          # simulates a switch landing
                         switched.set()
 
-                with mock.patch.object(relay, "get_all_agents", return_value=[]), \
+                with mock.patch.object(relay, "get_all_panes", return_value=([], [])), \
                      mock.patch.object(relay, "read_pane", return_value="Deploy to prod?"), \
                      mock.patch.object(relay, "broadcast", side_effect=switch_mid_broadcast):
                     task = asyncio.create_task(relay.event_push())
@@ -616,13 +851,11 @@ class RelaySessionSwitchTests(unittest.TestCase):
             saved = {}
             relay.known_panes.add("w1:p1")
 
-            with mock.patch.object(relay, "get_sessions", return_value=[
-                        {"name": "default", "running": True},
-                        {"name": "personal", "running": True}]), \
-                 mock.patch.object(relay, "_save_active_sessions",
+            with mock.patch.object(relay, "_save_active_sessions",
                                    side_effect=lambda: saved.update(relay.ACTIVE_SESSIONS)), \
                  mock.patch.object(relay, "audit"):
-                ok, err, changed = relay.apply_session_switch("local", "default")
+                ok, err, changed = relay.apply_session_switch(
+                    "local", "default", names={"default", "personal"})
 
             self.assertTrue(ok)
             self.assertEqual(err, "")
@@ -633,11 +866,10 @@ class RelaySessionSwitchTests(unittest.TestCase):
 
     def test_apply_session_switch_accepts_null_for_default_session(self):
         with loaded_relay() as relay:
-            with mock.patch.object(relay, "get_sessions", return_value=[
-                        {"name": "personal", "running": True}]), \
-                 mock.patch.object(relay, "_save_active_sessions"), \
+            with mock.patch.object(relay, "_save_active_sessions"), \
                  mock.patch.object(relay, "audit"):
-                ok, err, changed = relay.apply_session_switch("local", None)
+                # None never touches the allowlist -- it means "follow herdr's own default".
+                ok, err, changed = relay.apply_session_switch("local", None, names={"personal"})
 
             self.assertTrue(ok)
             self.assertTrue(changed)
@@ -652,20 +884,20 @@ class RelaySessionSwitchTests(unittest.TestCase):
         with loaded_relay() as relay:
             relay.known_panes.add("w1:p1")
             before = dict(relay.ACTIVE_SESSIONS)
-            with mock.patch.object(relay, "get_sessions", return_value=[
-                        {"name": "personal", "running": True}]), \
-                 mock.patch.object(relay, "audit"):
-                ok, err, changed = relay.apply_session_switch("local", "../../etc/passwd")
+            with mock.patch.object(relay, "audit"):
+                names = {"personal"}
+                ok, err, changed = relay.apply_session_switch(
+                    "local", "../../etc/passwd", names=names)
                 self.assertFalse(ok)
                 self.assertFalse(changed)
                 self.assertIn("unknown session", err)
 
-                ok, err, changed = relay.apply_session_switch("local", "personal2")
+                ok, err, changed = relay.apply_session_switch("local", "personal2", names=names)
                 self.assertFalse(ok)
                 self.assertFalse(changed)
                 self.assertIn("unknown session", err)
 
-                ok, err, changed = relay.apply_session_switch("local", "Personal")
+                ok, err, changed = relay.apply_session_switch("local", "Personal", names=names)
                 self.assertFalse(ok)
                 self.assertFalse(changed)
                 self.assertIn("unknown session", err)
@@ -678,15 +910,15 @@ class RelaySessionSwitchTests(unittest.TestCase):
         # is unhashable there and must be rejected, not raise.
         with loaded_relay() as relay:
             before = dict(relay.ACTIVE_SESSIONS)
-            with mock.patch.object(relay, "get_sessions", return_value=[
-                        {"name": "personal", "running": True}]), \
-                 mock.patch.object(relay, "audit"):
-                ok, err, changed = relay.apply_session_switch("local", ["personal"])
+            with mock.patch.object(relay, "audit"):
+                names = {"personal"}
+                ok, err, changed = relay.apply_session_switch("local", ["personal"], names=names)
                 self.assertFalse(ok)
                 self.assertFalse(changed)
                 self.assertIn("unknown session", err)
 
-                ok, err, changed = relay.apply_session_switch("local", {"name": "personal"})
+                ok, err, changed = relay.apply_session_switch(
+                    "local", {"name": "personal"}, names=names)
                 self.assertFalse(ok)
                 self.assertFalse(changed)
                 self.assertIn("unknown session", err)
@@ -699,7 +931,8 @@ class RelaySessionSwitchTests(unittest.TestCase):
             relay.known_panes.add("w1:p1")
             before = dict(relay.ACTIVE_SESSIONS)
             with mock.patch.object(relay, "audit"):
-                ok, err, changed = relay.apply_session_switch("user@nope", "personal")
+                ok, err, changed = relay.apply_session_switch(
+                    "user@nope", "personal", names=None)
 
             self.assertFalse(ok)
             self.assertFalse(changed)
@@ -709,23 +942,26 @@ class RelaySessionSwitchTests(unittest.TestCase):
 
     def test_apply_session_switch_allows_stopped_session(self):
         with loaded_relay() as relay:
+            # A stopped session is still selectable, and that property now lives in
+            # session_switch_names -- it takes every entry's name, running or not.
             with mock.patch.object(relay, "get_sessions", return_value=[
-                        {"name": "default", "running": False}]), \
-                 mock.patch.object(relay, "_save_active_sessions"), \
+                        {"name": "default", "running": False}]):
+                names = relay.session_switch_names("local")
+            self.assertEqual(names, {"default"})
+
+            with mock.patch.object(relay, "_save_active_sessions"), \
                  mock.patch.object(relay, "audit"):
-                ok, err, changed = relay.apply_session_switch("local", "default")
+                ok, err, changed = relay.apply_session_switch("local", "default", names=names)
 
             self.assertTrue(ok)
             self.assertTrue(changed)
 
     def test_apply_session_switch_attributes_audit_to_caller(self):
         with loaded_relay() as relay:
-            with mock.patch.object(relay, "get_sessions", return_value=[
-                        {"name": "default", "running": True}]), \
-                 mock.patch.object(relay, "_save_active_sessions"), \
+            with mock.patch.object(relay, "_save_active_sessions"), \
                  mock.patch.object(relay, "audit") as audit_mock:
                 ok, err, changed = relay.apply_session_switch(
-                    "local", "default", ip="10.0.0.5", device="phone")
+                    "local", "default", ip="10.0.0.5", device="phone", names={"default"})
 
             self.assertTrue(ok)
             self.assertTrue(changed)
@@ -740,12 +976,11 @@ class RelaySessionSwitchTests(unittest.TestCase):
         # reset exists to prevent.
         with loaded_relay() as relay:
             relay.known_panes.add("w1:p1")
-            with mock.patch.object(relay, "get_sessions", return_value=[
-                        {"name": "default", "running": True}]), \
-                 mock.patch.object(relay, "_save_active_sessions",
+            with mock.patch.object(relay, "_save_active_sessions",
                                    side_effect=OSError("disk full")), \
                  mock.patch.object(relay, "audit") as audit_mock:
-                ok, err, changed = relay.apply_session_switch("local", "default")
+                ok, err, changed = relay.apply_session_switch(
+                    "local", "default", names={"default"})
 
             self.assertTrue(ok)
             self.assertEqual(err, "")
@@ -756,21 +991,59 @@ class RelaySessionSwitchTests(unittest.TestCase):
 
     def test_apply_session_switch_is_noop_when_already_active(self):
         with loaded_relay() as relay:
-            with mock.patch.object(relay, "get_sessions", return_value=[
-                        {"name": "default", "running": True}]), \
-                 mock.patch.object(relay, "_save_active_sessions"), \
+            with mock.patch.object(relay, "_save_active_sessions"), \
                  mock.patch.object(relay, "audit"):
-                ok, err, changed = relay.apply_session_switch("local", "default")
+                ok, err, changed = relay.apply_session_switch(
+                    "local", "default", names={"default"})
                 self.assertTrue(ok)
                 self.assertTrue(changed)   # the real switch
 
                 relay.known_panes.add("w1:p1")
-                ok, err, changed = relay.apply_session_switch("local", "default")
+                ok, err, changed = relay.apply_session_switch(
+                    "local", "default", names={"default"})
 
             self.assertTrue(ok)
             self.assertEqual(err, "")
             self.assertFalse(changed)   # the no-op re-selection
             self.assertIn("w1:p1", relay.known_panes)
+
+    def test_session_switch_names_reports_an_unknown_host_as_none(self):
+        """None, not an empty set: the handler passes it straight through, and an empty set
+        would be indistinguishable from a host with no sessions on it."""
+        with loaded_relay() as relay:
+            relay.REMOTES.clear()
+            with mock.patch.object(relay, "get_sessions") as sessions:
+                self.assertIsNone(relay.session_switch_names("user@nope"))
+            sessions.assert_not_called()
+
+    def test_apply_session_switch_will_not_run_without_an_allowlist(self):
+        """`names` is keyword-only with no default so this function cannot reach a blocking
+        call. A caller that forgets it must fail loudly, not fall back to reading the list."""
+        with loaded_relay() as relay:
+            with self.assertRaises(TypeError):
+                relay.apply_session_switch("local", "default")
+
+    def test_an_empty_allowlist_rejects_every_named_session(self):
+        """Fail closed: a source whose session list could not be read must not become a source
+        where any name is accepted -- the value ends up interpolated into an ssh argv."""
+        with loaded_relay() as relay:
+            before = dict(relay.ACTIVE_SESSIONS)
+            with mock.patch.object(relay, "audit"):
+                for names in (set(), None):
+                    with self.subTest(names=names):
+                        ok, err, changed = relay.apply_session_switch(
+                            "local", "default", names=names)
+                        self.assertFalse(ok)
+                        self.assertFalse(changed)
+                        self.assertIn("unknown session", err)
+            self.assertEqual(relay.ACTIVE_SESSIONS, before)
+
+            # ...but following herdr's own default still works, since that names nothing.
+            with mock.patch.object(relay, "_save_active_sessions"), \
+                 mock.patch.object(relay, "audit"):
+                ok, err, changed = relay.apply_session_switch("local", None, names=None)
+            self.assertTrue(ok)
+            self.assertTrue(changed)
 
     def test_sessions_message_shape(self):
         with loaded_relay() as relay:
@@ -841,8 +1114,8 @@ class RelaySessionSwitchTests(unittest.TestCase):
             )
             order = []
 
-            def fake_apply(host, session, ip, device):
-                order.append(("apply", host, session, ip, device))
+            def fake_apply(host, session, ip, device, *, names):
+                order.append(("apply", host, session, ip, device, names))
                 return True, "", True
 
             async def fake_broadcast_sessions():
@@ -856,12 +1129,14 @@ class RelaySessionSwitchTests(unittest.TestCase):
 
             ws.send = record_send
 
-            with mock.patch.object(relay, "apply_session_switch", side_effect=fake_apply) as apply_mock, \
+            with mock.patch.object(relay, "session_switch_names", return_value={"personal"}), \
+                 mock.patch.object(relay, "apply_session_switch", side_effect=fake_apply) as apply_mock, \
                  mock.patch.object(relay, "broadcast_sessions", side_effect=fake_broadcast_sessions), \
                  mock.patch.object(relay, "_poll_once", side_effect=fake_poll_once):
                 asyncio.run(relay.handle_client(ws))
 
-            apply_mock.assert_called_once_with("user@host", "personal", "127.0.0.1", "script")
+            apply_mock.assert_called_once_with(
+                "user@host", "personal", "127.0.0.1", "script", names={"personal"})
             self.assertEqual(
                 [step[0] for step in order],
                 ["apply", "broadcast_sessions", "send", "poll_once"],
@@ -889,14 +1164,16 @@ class RelaySessionSwitchTests(unittest.TestCase):
                 headers={"X-Herdr-Remote-Command": "1"},
             )
 
-            with mock.patch.object(
+            with mock.patch.object(relay, "session_switch_names", return_value=None), \
+                 mock.patch.object(
                         relay, "apply_session_switch",
                         return_value=(False, "unknown host: bogus", False)) as apply_mock, \
                  mock.patch.object(relay, "broadcast_sessions", new=mock.AsyncMock()) as broadcast_mock, \
                  mock.patch.object(relay, "_poll_once", new=mock.AsyncMock()) as poll_mock:
                 asyncio.run(relay.handle_client(ws))
 
-            apply_mock.assert_called_once_with("bogus", "default", "127.0.0.1", "script")
+            apply_mock.assert_called_once_with(
+                "bogus", "default", "127.0.0.1", "script", names=None)
             self.assertEqual(
                 json.loads(ws.sent[-1]),
                 {
@@ -926,14 +1203,16 @@ class RelaySessionSwitchTests(unittest.TestCase):
                 headers={"X-Herdr-Remote-Command": "1"},
             )
 
-            with mock.patch.object(
+            with mock.patch.object(relay, "session_switch_names", return_value={"default"}), \
+                 mock.patch.object(
                         relay, "apply_session_switch",
                         return_value=(True, "", False)) as apply_mock, \
                  mock.patch.object(relay, "broadcast_sessions", new=mock.AsyncMock()) as broadcast_mock, \
                  mock.patch.object(relay, "_poll_once", new=mock.AsyncMock()) as poll_mock:
                 asyncio.run(relay.handle_client(ws))
 
-            apply_mock.assert_called_once_with("local", "default", "127.0.0.1", "script")
+            apply_mock.assert_called_once_with(
+                "local", "default", "127.0.0.1", "script", names={"default"})
             broadcast_mock.assert_not_awaited()
             poll_mock.assert_not_awaited()
             self.assertEqual(
@@ -1005,9 +1284,10 @@ class RelayResponseTests(unittest.TestCase):
                  mock.patch.object(relay.subprocess, "run", return_value=completed) as run:
                 asyncio.run(relay.handle_client(ws))
 
-            command_prefix = [
-                "ssh", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes", remote, relay.REMOTE_HERDR
-            ]
+            # Built from the relay's own option list: the flags are its business (it added
+            # connection multiplexing), the ORDER -- options, then target, then remote binary --
+            # is the contract this test is here to hold.
+            command_prefix = ["ssh", *relay.SSH_BASE_ARGS, remote, relay.REMOTE_HERDR]
             self.assertEqual(
                 [call.args[0] for call in run.call_args_list],
                 [
@@ -1315,6 +1595,212 @@ class RelayQuestionTests(unittest.TestCase):
             self.assertIn("prompt changed", json.loads(ws.sent[-1])["message"])
 
 
+class RelayKeyGrammarTests(unittest.TestCase):
+    """The relay forwards keys in herdr's grammar, not tmux's.
+
+    Live-verified against herdr 0.8.0 (protocol 19) on a throwaway session: `C-c` is the only
+    tmux-style spelling herdr still aliases, `BSpace` was never valid, and the `+`-joined chords
+    the web app composes at runtime are.
+    """
+
+    # herdr matches special names case-insensitively, so a client spelling `esc` or `shift+tab`
+    # in lower case is not wrong.
+    ACCEPTED = ("ctrl+c", "shift+tab", "alt+Up", "ctrl+shift+p", "C-c", "Enter", "Escape",
+                "esc", "tab", "Space", "Backspace", "F5", "f12", "Up", "1", "y")
+    # PageUp/PageDown/Home/End are accepted by the RELAY but refused by herdr in every spelling
+    # (re-probed on 0.8.2); they leave as CSI bytes through `pane send-text`. Insert and Delete are
+    # equally refused by herdr and deliberately not covered, which is why they stay rejected here.
+    ACCEPTED = ACCEPTED + ("PageUp", "pagedown", "Home", "End", "ctrl+Home", "shift+PageUp")
+    REJECTED = ("BSpace", "BTab", "PgUp", "Insert", "Delete",
+                "C-u", "M-x", "cmd+q", "ctrl+", "+c", "", "nonsense",
+                "ctrl+ctrl+c", "ctrl+ctrl+Home")
+
+    def test_key_grammar_matches_what_herdr_accepts(self):
+        with loaded_relay() as relay:
+            for key in self.ACCEPTED:
+                with self.subTest(key=key):
+                    self.assertTrue(relay.key_is_allowed(key), f"{key!r} must be forwarded")
+            for key in self.REJECTED:
+                with self.subTest(key=key):
+                    self.assertFalse(relay.key_is_allowed(key), f"{key!r} must be refused")
+
+    def test_non_string_keys_are_refused(self):
+        with loaded_relay() as relay:
+            for key in (None, 1, ["ctrl", "c"], {"key": "c"}):
+                with self.subTest(key=key):
+                    self.assertFalse(relay.key_is_allowed(key))
+
+    def test_send_keys_forwards_a_modifier_chord_the_web_app_composes(self):
+        """The Ctrl presets in web/index.html were rejected wholesale by the old allowlist."""
+        pane_id = "w0:p1"
+        with loaded_relay() as relay:
+            relay.known_panes.add(pane_id)
+            ws = _FakeWebSocket([json.dumps({
+                "type": "send_keys",
+                "pane_id": pane_id,
+                "keys": ["ctrl+c"],
+                "request_id": "req-1",
+            })])
+            completed = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+            with mock.patch.object(relay, "send_current_snapshot", new=mock.AsyncMock()), \
+                 mock.patch.object(relay, "read_pane", return_value=""), \
+                 mock.patch.object(relay, "run_herdr_result", return_value=completed) as run:
+                asyncio.run(relay.handle_client(ws))
+
+            self.assertEqual(
+                run.call_args.args,
+                ("pane", "send-keys", pane_id, "ctrl+c"),
+            )
+            self.assertEqual(
+                [json.loads(message) for message in ws.sent],
+                [{"type": "command_result", "command": "send_keys", "ok": True, "request_id": "req-1"}],
+            )
+
+    def test_send_keys_refuses_an_empty_or_non_list_keys_field(self):
+        pane_id = "w0:p1"
+        for keys in ([], "ctrl+c", None):
+            with self.subTest(keys=keys):
+                with loaded_relay() as relay:
+                    relay.known_panes.add(pane_id)
+                    ws = _FakeWebSocket([json.dumps({
+                        "type": "send_keys", "pane_id": pane_id, "keys": keys,
+                    })])
+                    with mock.patch.object(relay, "send_current_snapshot", new=mock.AsyncMock()), \
+                         mock.patch.object(relay, "read_pane", return_value=""), \
+                         mock.patch.object(relay, "run_herdr_result") as run:
+                        asyncio.run(relay.handle_client(ws))
+                    run.assert_not_called()
+                    self.assertEqual(json.loads(ws.sent[0])["type"], "error")
+
+    def test_a_refused_key_is_named_and_logged(self):
+        """The refusal returns above the log line, so it used to leave no trace at all.
+
+        That is precisely the case worth diagnosing -- a client newer than the relay it talks to --
+        so both the message and the log say which key, and only which key.
+        """
+        pane_id = "w0:p1"
+        with loaded_relay() as relay:
+            relay.known_panes.add(pane_id)
+            ws = _FakeWebSocket([json.dumps({
+                "type": "send_keys", "pane_id": pane_id, "keys": ["Enter", "Insert"],
+            })])
+            with mock.patch.object(relay, "send_current_snapshot", new=mock.AsyncMock()), \
+                 mock.patch.object(relay, "read_pane", return_value=""), \
+                 mock.patch.object(relay, "run_herdr_result") as run, \
+                 mock.patch.object(relay.log, "warning") as warned:
+                asyncio.run(relay.handle_client(ws))
+            run.assert_not_called()
+            message = json.loads(ws.sent[0])["message"]
+            self.assertIn("Insert", message)
+            self.assertNotIn("Enter", message, "only the refused key belongs in the message")
+            self.assertTrue(
+                any("Insert" in str(call) for call in warned.call_args_list),
+                "the refused key must reach the log")
+
+
+class RelayCsiKeyTests(unittest.TestCase):
+    """Keys herdr refuses outright, delivered as the CSI bytes a terminal would send.
+
+    Live-probed on herdr 0.8.2: `pane send-keys` answers `unsupported key PageUp` to every
+    spelling of PageUp/PageDown/Home/End, while `pane send-text` passes ESC through byte for byte
+    (`cat -v` in a throwaway pane showed `^[[5~`). `less` on a 500-line file then paged from row 1
+    to row 70 on ESC[6~ and back on ESC[5~, so a real TUI reads the bytes AS the key.
+    """
+
+    # xterm's encoding: 1 + shift(1) + alt(2) + ctrl(4). The tilde keys carry the modifier as a
+    # second parameter; the letter keys grow a leading `1;` they do not have when bare.
+    EXPECTED = {
+        "PageUp": "\x1b[5~",
+        "PageDown": "\x1b[6~",
+        "pageup": "\x1b[5~",
+        "Home": "\x1b[H",
+        "End": "\x1b[F",
+        "ctrl+Home": "\x1b[1;5H",
+        "ctrl+End": "\x1b[1;5F",
+        "shift+PageUp": "\x1b[5;2~",
+        "alt+PageDown": "\x1b[6;3~",
+        "ctrl+shift+Home": "\x1b[1;6H",
+    }
+
+    def test_sequences_match_the_terminal_encoding(self):
+        with loaded_relay() as relay:
+            for key, sequence in self.EXPECTED.items():
+                with self.subTest(key=key):
+                    self.assertEqual(relay.key_escape_sequence(key), sequence)
+
+    def test_keys_herdr_can_send_itself_get_no_sequence(self):
+        """An empty return is what routes a key to `send-keys`, so it must stay empty."""
+        with loaded_relay() as relay:
+            for key in ("Enter", "Escape", "ctrl+c", "Up", "C-c", "y", "F5", "Delete", "Insert"):
+                with self.subTest(key=key):
+                    self.assertEqual(relay.key_escape_sequence(key), "")
+
+    def test_a_malformed_modifier_resolves_to_nothing_rather_than_the_bare_key(self):
+        """Silently dropping the modifier would send Home when the client asked for cmd+Home."""
+        with loaded_relay() as relay:
+            for key in ("cmd+Home", "ctrl+ctrl+Home", "super+End", "ctrl+", "+Home", None, 5):
+                with self.subTest(key=key):
+                    self.assertEqual(relay.key_escape_sequence(key), "")
+
+    def test_a_page_key_goes_out_as_text_not_as_a_key(self):
+        pane_id = "w0:p1"
+        with loaded_relay() as relay:
+            relay.known_panes.add(pane_id)
+            ws = _FakeWebSocket([json.dumps({
+                "type": "send_keys", "pane_id": pane_id, "keys": ["PageUp"], "request_id": "req-1",
+            })])
+            completed = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+            with mock.patch.object(relay, "send_current_snapshot", new=mock.AsyncMock()), \
+                 mock.patch.object(relay, "read_pane", return_value=""), \
+                 mock.patch.object(relay, "run_herdr_result", return_value=completed) as run:
+                asyncio.run(relay.handle_client(ws))
+            self.assertEqual(run.call_args.args, ("pane", "send-text", pane_id, "\x1b[5~"))
+            self.assertEqual(
+                [json.loads(message) for message in ws.sent],
+                [{"type": "command_result", "command": "send_keys", "ok": True, "request_id": "req-1"}],
+            )
+
+    def test_a_mixed_queue_keeps_its_order_across_the_two_channels(self):
+        """The key queue composes arbitrary runs, and [Escape, PageUp, Enter] must arrive so."""
+        pane_id = "w0:p1"
+        with loaded_relay() as relay:
+            relay.known_panes.add(pane_id)
+            ws = _FakeWebSocket([json.dumps({
+                "type": "send_keys", "pane_id": pane_id,
+                "keys": ["Escape", "PageUp", "PageDown", "Enter"],
+            })])
+            completed = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+            with mock.patch.object(relay, "send_current_snapshot", new=mock.AsyncMock()), \
+                 mock.patch.object(relay, "read_pane", return_value=""), \
+                 mock.patch.object(relay, "run_herdr_result", return_value=completed) as run:
+                asyncio.run(relay.handle_client(ws))
+            self.assertEqual(
+                [call.args for call in run.call_args_list],
+                [
+                    ("pane", "send-keys", pane_id, "Escape"),
+                    # One call, because a run of CSI keys concatenates into one text argument.
+                    ("pane", "send-text", pane_id, "\x1b[5~\x1b[6~"),
+                    ("pane", "send-keys", pane_id, "Enter"),
+                ],
+            )
+
+    def test_a_failing_text_call_reports_and_stops(self):
+        """A half-delivered queue must not answer ok, and must not send the rest."""
+        pane_id = "w0:p1"
+        with loaded_relay() as relay:
+            relay.known_panes.add(pane_id)
+            ws = _FakeWebSocket([json.dumps({
+                "type": "send_keys", "pane_id": pane_id, "keys": ["PageUp", "Enter"],
+            })])
+            failed = subprocess.CompletedProcess([], 1, stdout="", stderr="nope")
+            with mock.patch.object(relay, "send_current_snapshot", new=mock.AsyncMock()), \
+                 mock.patch.object(relay, "read_pane", return_value=""), \
+                 mock.patch.object(relay, "run_herdr_result", return_value=failed) as run:
+                asyncio.run(relay.handle_client(ws))
+            self.assertEqual(len(run.call_args_list), 1)
+            self.assertEqual(json.loads(ws.sent[0])["type"], "error")
+
+
 class RelayCommandTests(unittest.TestCase):
     def test_command_connection_skips_snapshot_and_correlates_ack(self):
         with loaded_relay() as relay:
@@ -1409,7 +1895,7 @@ class RelayEventPushTests(unittest.IsolatedAsyncioTestCase):
                         broadcasts_complete.set()
 
                 with mock.patch.object(
-                    relay, "get_all_agents", return_value=snapshot
+                    relay, "get_all_panes", return_value=(snapshot, [])
                 ), mock.patch.object(
                     relay, "read_pane", return_value="approve all pending"
                 ) as read_pane, mock.patch.object(
@@ -1425,10 +1911,17 @@ class RelayEventPushTests(unittest.IsolatedAsyncioTestCase):
                             await task
 
                 expected_prompt_id = relay.question_prompt_id("event-pane", "approve all pending")
+                # update_pane_maps stamps last_active_at/last_seen_at onto the records on their way
+                # out (stamp_activity). Asserted here as present-on-every-agent, then dropped, so
+                # this test stays about the ORDER of the two broadcasts.
+                for agent in messages[0]["agents"]:
+                    self.assertIn("last_active_at", agent)
+                    self.assertIn("last_seen_at", agent)
+                    del agent["last_active_at"], agent["last_seen_at"]
                 self.assertEqual(
                     messages,
                     [
-                        {"type": "agents", "agents": expected_agents},
+                        {"type": "agents", "agents": expected_agents, "panes": []},
                         {
                             "type": "blocked",
                             "pane_id": "event-pane",
@@ -1457,6 +1950,45 @@ class RelayEventPushTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(relay.known_panes, expected_pane_ids)
                 self.assertEqual(relay.pane_remote_map, expected_remote_map)
                 self.assertNotIn("stale-pane", relay.last_statuses)
+
+
+class RelayTerminalTitleTests(unittest.TestCase):
+    """The title is live activity or it is the harness saying its own name -- never a session."""
+
+    def test_a_working_agents_activity_survives_and_the_banner_does_not(self):
+        with loaded_relay() as relay:
+            # What a working claude puts there.
+            self.assertEqual(relay.activity_title("fix P0, draft the P1 plan", "claude"),
+                             "fix P0, draft the P1 plan")
+            # What an idle or done one leaves behind. Measured on one real host: of nine agent
+            # panes, seven reported no title and the two that did reported exactly this.
+            self.assertEqual(relay.activity_title("Claude Code", "claude"), "")
+            self.assertEqual(relay.activity_title("\u2733 Claude Code", "claude"), "")
+            # Prefix matching, so a new harness needs no entry in a list.
+            self.assertEqual(relay.activity_title("Codex", "codex"), "")
+            self.assertEqual(relay.activity_title("OpenCode", "opencode"), "")
+            self.assertEqual(relay.activity_title(None, "claude"), "")
+            self.assertEqual(relay.activity_title("   ", "claude"), "")
+            # A title that merely mentions the harness is still a title.
+            self.assertEqual(relay.activity_title("porting the claude reader", "claude"),
+                             "porting the claude reader")
+            # No agent name to compare against: nothing is a banner.
+            self.assertEqual(relay.activity_title("Claude Code", ""), "Claude Code")
+
+    def test_the_agents_entry_carries_the_activity_and_drops_the_banner(self):
+        listing = json.dumps({"result": {"panes": [
+            {"pane_id": "w1:p1", "agent": "claude", "agent_status": "working",
+             "cwd": "/w/herdr", "workspace_id": "w1", "tab_id": "w1:t1",
+             "terminal_title_stripped": "fix the poll"},
+            {"pane_id": "w1:p2", "agent": "claude", "agent_status": "done",
+             "cwd": "/w/herdr", "workspace_id": "w1", "tab_id": "w1:t1",
+             "terminal_title_stripped": "Claude Code"},
+        ]}})
+        with loaded_relay() as relay:
+            with mock.patch.object(relay, "run_herdr", return_value=listing), \
+                 mock.patch.object(relay, "get_workspace_labels", return_value={}):
+                agents = relay.get_agents_from_host()
+            self.assertEqual([a["title"] for a in agents], ["fix the poll", ""])
 
 
 class RelaySubprocessConcurrencyTests(unittest.TestCase):
@@ -1519,8 +2051,9 @@ class RelaySubprocessConcurrencyTests(unittest.TestCase):
             def command_target(command):
                 if command[0] != "ssh":
                     return "local"
-                batch_mode_index = command.index("BatchMode=yes")
-                return command[batch_mode_index + 1]
+                # The SSH target sits directly after the shared option list, however long that
+                # list is (it grew when multiplexing was added).
+                return command[1 + len(relay.SSH_BASE_ARGS)]
 
             def fake_subprocess_run(command, **kwargs):
                 target = command_target(command)
@@ -1557,107 +2090,795 @@ class RelaySubprocessConcurrencyTests(unittest.TestCase):
                     self.assertEqual(other.result(timeout=2), "ok")
                     self.assertEqual(local.result(timeout=2), "ok")
 
+    def test_a_slow_herdr_call_does_not_stall_the_event_loop(self):
+        """The whole point of the worker threads: one slow call must not freeze the relay.
 
-class RelaySessionTranscriptTests(unittest.TestCase):
-    @staticmethod
-    def _write_log(root, slug, name, rows):
-        session_dir = os.path.join(root, slug)
-        os.makedirs(session_dir, exist_ok=True)
-        path = os.path.join(session_dir, name)
-        with open(path, "w", encoding="utf-8") as handle:
-            for row in rows:
-                handle.write(json.dumps(row) + "\n")
-        return path
-
-    def test_project_slug_replaces_every_non_alphanumeric_character(self):
+        Awaited inline, a poll tick holds the loop for as long as its herdr call takes -- locally
+        a few ms, but an SSH read can run to the 15s timeout, and for that whole time no other
+        client is served and no broadcast goes out.
+        """
         with loaded_relay() as relay:
-            # Underscores and dots are folded too, not just separators -- a
-            # slug built by replacing '/' alone misses these projects entirely.
-            self.assertEqual(
-                relay.claude_project_slug("/home/user/report_draft__final_"),
-                "-home-user-report-draft--final-",
-            )
-            self.assertEqual(
-                relay.claude_project_slug("/home/user/app.v2"), "-home-user-app-v2"
-            )
+            def slow_subprocess_run(command, **kwargs):
+                time.sleep(0.3)
+                return subprocess.CompletedProcess(command, 0, stdout="{}", stderr="")
 
-    def test_transcript_keeps_prose_and_drops_tool_traffic(self):
-        with loaded_relay() as relay, tempfile.TemporaryDirectory() as root:
-            relay.CLAUDE_SESSION_ROOT = root
-            self._write_log(root, "-home-user-project","a.jsonl", [
-                {"type": "user", "message": {"content": "ship the fix"}},
-                {"type": "assistant", "message": {"content": [
-                    {"type": "text", "text": "Done."},
-                    {"type": "tool_use", "name": "Bash", "input": {}},
-                ]}},
-                {"type": "user", "message": {"content": [
-                    {"type": "tool_result", "content": "exit 0"},
-                ]}},
-                {"type": "attachment", "message": {"content": "not conversation"}},
-                {"type": "assistant", "message": {"content": "   "}},
-            ])
+            async def scenario():
+                ticks = 0
 
-            self.assertEqual(
-                relay.read_session_transcript("/home/user/project"),
-                [
-                    {"role": "user", "content": "ship the fix"},
-                    {"role": "assistant", "content": "Done."},
-                ],
-            )
-            # A pane whose project was never opened in Claude Code is normal,
-            # not an error.
-            self.assertEqual(relay.read_session_transcript("/no/such/project"), [])
-            self.assertEqual(relay.read_session_transcript(""), [])
+                async def ticker():
+                    nonlocal ticks
+                    while True:
+                        await asyncio.sleep(0.005)
+                        ticks += 1
 
-    def test_transcript_prefers_newest_session_and_survives_a_torn_line(self):
-        with loaded_relay() as relay, tempfile.TemporaryDirectory() as root:
-            relay.CLAUDE_SESSION_ROOT = root
-            older = self._write_log(root, "-home-user-project","older.jsonl", [
-                {"type": "user", "message": {"content": "old session"}},
-            ])
-            newer = self._write_log(root, "-home-user-project","newer.jsonl", [
-                {"type": "user", "message": {"content": "new session"}},
-            ])
-            os.utime(older, (1, 1))
-            os.utime(newer, (2, 2))
-            # Claude Code appends live, so the tail can be half-written.
-            with open(newer, "a", encoding="utf-8") as handle:
-                handle.write("{not json\n")
-                handle.write(json.dumps(
-                    {"type": "assistant", "message": {"content": "still here"}}
-                ) + "\n")
+                beat = asyncio.create_task(ticker())
+                await asyncio.sleep(0)  # let the ticker reach its first await
+                await relay._poll_once()
+                beat.cancel()
+                return ticks
 
-            self.assertEqual(
-                [m["content"] for m in relay.read_session_transcript("/home/user/project")],
-                ["new session", "still here"],
+            with mock.patch.object(relay.subprocess, "run", side_effect=slow_subprocess_run):
+                ticks = asyncio.run(scenario())
+
+            # 0.3s of subprocess against a 5ms tick. Inline it is exactly 0; off the loop it is
+            # tens. Ten is far below the ~60 a healthy loop manages and far above a blocked one.
+            self.assertGreater(
+                ticks, 10, "the event loop was blocked for the length of the herdr call"
             )
 
-    def test_get_history_serves_the_log_only_for_local_claude_panes(self):
-        with loaded_relay() as relay, tempfile.TemporaryDirectory() as root:
-            relay.CLAUDE_SESSION_ROOT = root
-            self._write_log(root, "-home-user-project","a.jsonl", [
-                {"type": "assistant", "message": {"content": "from the log"}},
-            ])
+    def test_no_blocking_call_is_awaited_inline_from_async_code(self):
+        """Structural guard for the above, because the behavioural test only covers one path.
 
-            cases = [
-                ("local-claude", "claude", None, [{"role": "assistant", "content": "from the log"}]),
-                ("remote-claude", "claude", "build-box", []),
-                ("local-other", "omp", None, []),
+        Builds the call graph over the relay's own sync functions, seeds it with the primitives
+        that actually block, then fails on any of them called straight from an `async def` body
+        rather than through asyncio.to_thread. A new handler that forgets the wrapper is a silent
+        regression -- everything still works, the relay just stops answering anyone else while it
+        runs -- so it has to be caught here rather than in review.
+        """
+        seeds = {"subprocess.run", "subprocess.check_output", "time.sleep",
+                 "zc.unregister_service"}
+        tree = ast.parse(RELAY_PATH.read_text(encoding="utf-8"), str(RELAY_PATH))
+
+        def called_names(node, unwrap_to_thread=False):
+            """Call names directly in `node`, not descending into nested defs.
+
+            With unwrap_to_thread, an asyncio.to_thread(fn, ...) contributes nothing for `fn`
+            itself -- that is the whole point of the wrapper -- but its remaining arguments are
+            still walked, so `to_thread(f, read_pane(x))` is not let through.
+            """
+            found, stack = [], list(ast.iter_child_nodes(node))
+            while stack:
+                current = stack.pop()
+                if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                if isinstance(current, ast.Call):
+                    name = _dotted(current.func)
+                    if unwrap_to_thread and name == "asyncio.to_thread":
+                        stack.extend(current.args[1:] + current.keywords)
+                        continue
+                    if name:
+                        found.append((name, current.lineno))
+                stack.extend(ast.iter_child_nodes(current))
+            return found
+
+        sync = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+        asynchronous = {n.name: n for n in tree.body if isinstance(n, ast.AsyncFunctionDef)}
+
+        blocking = {name for name, node in sync.items()
+                    if any(call in seeds for call, _ in called_names(node))}
+        while True:
+            grown = {name for name, node in sync.items()
+                     if name not in blocking
+                     and any(call in blocking for call, _ in called_names(node))}
+            if not grown:
+                break
+            blocking |= grown
+
+        # If this set ever empties the test has stopped testing anything -- a rename upstream
+        # would silently make every assertion below vacuous.
+        self.assertIn("run_herdr", blocking)
+        self.assertIn("read_pane", blocking)
+        self.assertIn("get_all_agents", blocking)
+
+        offenders = [
+            f"{RELAY_PATH.name}:{line} {call}() inside async def {holder}()"
+            for holder, node in asynchronous.items()
+            for call, line in called_names(node, unwrap_to_thread=True)
+            if call in blocking or call in seeds
+        ]
+        self.assertEqual(offenders, [], "wrap these in asyncio.to_thread:\n  " + "\n  ".join(offenders))
+
+
+def _dotted(node):
+    """`a.b.c` for an attribute/name chain, else None."""
+    parts = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if isinstance(node, ast.Name):
+        parts.append(node.id)
+        return ".".join(reversed(parts))
+    return None
+
+
+
+
+class RelayPaneReadSourceTests(unittest.TestCase):
+    """Reads the relay makes on a timer must never harvest an agent's scrollback.
+
+    A `recent` read in text format walks the agent's own mouse-scroll interface: measured on herdr
+    0.8.0 at 6.2s for 200 lines, only while the agent is idle, and it scrolls the operator's
+    terminal. read_pane runs on every poll tick for every blocked pane.
+    """
+
+    def test_prompt_reads_use_the_rendered_viewport(self):
+        with loaded_relay() as relay:
+            with mock.patch.object(relay, "run_herdr", return_value="a question") as run:
+                relay.read_pane("w0:p1")
+            self.assertEqual(
+                run.call_args.args,
+                ("pane", "read", "w0:p1", "--lines", "100", "--source", "visible"),
+            )
+
+    def test_client_read_picks_its_own_source_and_is_clamped_to_herdrs_ceiling(self):
+        pane_id = "w0:p1"
+        with loaded_relay() as relay:
+            relay.known_panes.add(pane_id)
+            ws = _FakeWebSocket([json.dumps({
+                "type": "read_pane", "pane_id": pane_id,
+                # `recent_unwrapped` is the socket spelling; the CLI wants the hyphen.
+                "lines": 9000, "source": "recent_unwrapped", "format": "ansi",
+            })])
+            with mock.patch.object(relay, "send_current_snapshot", new=mock.AsyncMock()), \
+                 mock.patch.object(relay, "run_herdr", return_value="output") as run:
+                asyncio.run(relay.handle_client(ws))
+            self.assertEqual(
+                run.call_args.args,
+                ("pane", "read", pane_id, "--lines", str(relay.MAX_READ_LINES),
+                 "--source", "recent-unwrapped", "--format", "ansi"),
+            )
+
+    def test_client_read_refuses_an_unknown_source(self):
+        pane_id = "w0:p1"
+        with loaded_relay() as relay:
+            relay.known_panes.add(pane_id)
+            ws = _FakeWebSocket([json.dumps({
+                "type": "read_pane", "pane_id": pane_id, "source": "scrollback",
+            })])
+            with mock.patch.object(relay, "send_current_snapshot", new=mock.AsyncMock()), \
+                 mock.patch.object(relay, "run_herdr") as run:
+                asyncio.run(relay.handle_client(ws))
+            run.assert_not_called()
+            self.assertEqual(
+                json.loads(ws.sent[0]),
+                {"type": "error", "message": "invalid pane read source"},
+            )
+
+
+class RelayPaneFieldTests(unittest.TestCase):
+    """`pane list` already reports these; dropping them cost the clients real capability."""
+
+    PANE_LIST = {
+        "result": {
+            "panes": [
+                {
+                    "pane_id": "w0:p1", "agent": "claude", "agent_status": "idle",
+                    "cwd": "/home/dev/project", "workspace_id": "w0", "tab_id": "w0:t1",
+                    # A working title, not the harness banner: activity_title drops the banner
+                    # (RelayTerminalTitleTests covers that), so a banner here would prove nothing
+                    # about whether the field is carried through at all.
+                    "terminal_title_stripped": "fix the poll tick",
+                    "agent_session": {"agent": "claude", "kind": "id", "value": "abc-123"},
+                    "scroll": {"offset_from_bottom": 0, "max_offset_from_bottom": 0,
+                               "viewport_rows": 67},
+                },
+                {
+                    # A shell pane: no agent, so it is still filtered out (that is P2's job), and
+                    # it is the pane shape that HAS a scrollback ring.
+                    "pane_id": "w0:p2", "agent": None, "agent_status": "unknown",
+                    "cwd": "/home/dev/project", "workspace_id": "w0", "tab_id": "w0:t1",
+                    "scroll": {"offset_from_bottom": 0, "max_offset_from_bottom": 9612,
+                               "viewport_rows": 33},
+                },
             ]
-            for pane_id, agent, remote, expected in cases:
-                with self.subTest(pane_id=pane_id):
-                    relay.known_panes.add(pane_id)
-                    relay.agent_cache[pane_id] = {"agent": agent, "cwd": "/home/user/project"}
-                    relay.pane_remote_map[pane_id] = remote
-                    ws = _FakeWebSocket([json.dumps({"type": "get_history", "pane_id": pane_id})])
+        }
+    }
 
-                    with mock.patch.object(relay, "send_current_snapshot", new=mock.AsyncMock()):
-                        asyncio.run(relay.handle_client(ws))
+    def test_agent_entries_carry_scrollback_depth_title_and_session_presence(self):
+        with loaded_relay() as relay:
+            with mock.patch.object(relay, "run_herdr", return_value=json.dumps(self.PANE_LIST)):
+                agents = relay.get_agents_from_host()
 
-                    self.assertEqual(
-                        json.loads(ws.sent[-1]),
-                        {"type": "history", "pane_id": pane_id, "messages": expected},
-                    )
+            self.assertEqual([a["pane_id"] for a in agents], ["w0:p1"])
+            agent = agents[0]
+            self.assertEqual(agent["title"], "fix the poll tick")
+            # An agent TUI on the alternate screen: nothing behind the viewport, which is how a
+            # client knows not to offer "load older".
+            self.assertEqual(agent["scrollback"], 0)
+            self.assertEqual(agent["viewport_rows"], 67)
+            self.assertTrue(agent["has_session"])
+            # The ref itself stays server-side -- no client needs a session uuid.
+            self.assertNotIn("agent_session", agent)
+            self.assertEqual(relay.pane_session_map["w0:p1"]["value"], "abc-123")
+
+    def test_a_session_reported_for_a_different_harness_is_not_trusted(self):
+        """herdr keeps reporting the LAST session a pane announced, across harness swaps."""
+        panes = json.loads(json.dumps(self.PANE_LIST))
+        panes["result"]["panes"][0]["agent"] = "pi"
+        with loaded_relay() as relay:
+            with mock.patch.object(relay, "run_herdr", return_value=json.dumps(panes)):
+                agents = relay.get_agents_from_host()
+            self.assertFalse(agents[0]["has_session"])
+            self.assertNotIn("w0:p1", relay.pane_session_map)
+
+    def test_stale_panes_drop_their_session_ref(self):
+        with loaded_relay() as relay:
+            relay.known_panes.add("gone")
+            relay.pane_session_map["gone"] = {"kind": "id", "value": "abc-123"}
+            relay.update_pane_maps([])
+            self.assertNotIn("gone", relay.pane_session_map)
+
+    def test_get_history_reports_why_it_has_nothing_and_spawns_nothing(self):
+        """A pane that names no session gets that as the answer -- not a bare empty list, which
+        read as 'this pane has no history' on every pane of every relay."""
+        pane_id = "w0:p1"
+        with loaded_relay() as relay:
+            relay.known_panes.add(pane_id)
+            ws = _FakeWebSocket([json.dumps({"type": "get_history", "pane_id": pane_id})])
+            with mock.patch.object(relay, "send_current_snapshot", new=mock.AsyncMock()), \
+                 mock.patch.object(relay, "run_herdr") as run:
+                asyncio.run(relay.handle_client(ws))
+            # No herdr subprocess, and for a remote pane no SSH round trip: the answer comes from
+            # state the poll loop already has.
+            run.assert_not_called()
+            self.assertEqual(
+                json.loads(ws.sent[0]),
+                {"type": "history", "pane_id": pane_id, "messages": [], "total": 0,
+                 "has_more": False, "title": "", "agent": "", "file_truncated": False,
+                 "unavailable": "no-session"},
+            )
+
+    def test_get_history_reads_the_transcript_the_pane_names(self):
+        pane_id = "w0:p1"
+        session_id = "1b3d9f8a-2c4e-4a6b-8d0f-112233445566"
+        rows = [
+            {"type": "ai-title", "aiTitle": "porting the reader"},
+            {"type": "user", "uuid": "u1", "timestamp": "2026-08-21T00:00:00Z",
+             "message": {"role": "user", "content": "does this work?"}},
+            {"type": "assistant", "uuid": "a1", "timestamp": "2026-08-21T00:00:01Z",
+             "message": {"role": "assistant", "content": [{"type": "text", "text": "it does"}]}},
+        ]
+        with loaded_relay() as relay, tempfile.TemporaryDirectory() as root:
+            project = Path(root) / "-home-someone-project"
+            project.mkdir()
+            (project / f"{session_id}.jsonl").write_text(
+                "\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8"
+            )
+            relay.transcript.LOCAL_ROOTS = [root]
+            relay.transcript.cache_clear()
+            relay.known_panes.add(pane_id)
+            relay.agent_cache[pane_id] = {"pane_id": pane_id, "agent": "claude"}
+            relay.pane_session_map[pane_id] = {"kind": "id", "value": session_id}
+            ws = _FakeWebSocket([json.dumps({"type": "get_history", "pane_id": pane_id})])
+            with mock.patch.object(relay, "send_current_snapshot", new=mock.AsyncMock()), \
+                 mock.patch.object(relay, "run_herdr") as run:
+                asyncio.run(relay.handle_client(ws))
+            run.assert_not_called()
+            payload = json.loads(ws.sent[0])
+        self.assertEqual(payload["unavailable"], None)
+        self.assertEqual(payload["title"], "porting the reader")
+        self.assertEqual(payload["agent"], "claude")
+        self.assertEqual([(m["role"], m["text"]) for m in payload["messages"]],
+                         [("user", "does this work?"), ("assistant", "it does")])
+        self.assertEqual(payload["total"], 2)
+        self.assertFalse(payload["has_more"])
+
+    def test_get_history_refuses_a_nonsense_cursor_type(self):
+        pane_id = "w0:p1"
+        with loaded_relay() as relay:
+            relay.known_panes.add(pane_id)
+            ws = _FakeWebSocket([json.dumps(
+                {"type": "get_history", "pane_id": pane_id, "before": {"not": "a cursor"}}
+            )])
+            with mock.patch.object(relay, "send_current_snapshot", new=mock.AsyncMock()):
+                asyncio.run(relay.handle_client(ws))
+            self.assertEqual(json.loads(ws.sent[0]),
+                             {"type": "error", "message": "invalid history cursor"})
+
+    def test_get_history_on_a_remote_pane_runs_one_locked_ssh_probe(self):
+        pane_id = "w0:p1"
+        session_id = "1b3d9f8a-2c4e-4a6b-8d0f-112233445566"
+        row = json.dumps({"type": "user", "uuid": "u1", "timestamp": "2026-08-21T00:00:00Z",
+                          "message": {"role": "user", "content": "from the far side"}})
+        body = (f"SIZE {len(row) + 1}\n" + row + "\n").encode()
+        with loaded_relay() as relay:
+            relay.transcript.cache_clear()
+            relay.known_panes.add(pane_id)
+            relay.pane_remote_map[pane_id] = "build-box"
+            relay.agent_cache[pane_id] = {"pane_id": pane_id, "agent": "claude"}
+            relay.pane_session_map[pane_id] = {"kind": "id", "value": session_id}
+            completed = subprocess.CompletedProcess([], 0, stdout=body, stderr=b"")
+            ws = _FakeWebSocket([json.dumps({"type": "get_history", "pane_id": pane_id})])
+            with mock.patch.object(relay, "send_current_snapshot", new=mock.AsyncMock()), \
+                 mock.patch.object(relay.subprocess, "run", return_value=completed) as run:
+                asyncio.run(relay.handle_client(ws))
+            payload = json.loads(ws.sent[0])
+            command = run.call_args[0][0]
+        self.assertEqual(payload["unavailable"], None)
+        self.assertEqual([m["text"] for m in payload["messages"]], ["from the far side"])
+        self.assertFalse(payload["file_truncated"])
+        # Same SSH terms as every other remote read, and the whole script is one argv element.
+        self.assertEqual(command[:1 + len(relay.SSH_BASE_ARGS) + 1],
+                         ["ssh", *relay.SSH_BASE_ARGS, "build-box"])
+        self.assertEqual(len(command), 1 + len(relay.SSH_BASE_ARGS) + 2)
+        self.assertIn(f"{session_id}.jsonl", command[-1])
+        self.assertTrue(command[-1].startswith("sh -c "))
+
+
+class RelayTerminalTitleTests(unittest.TestCase):
+    """The title is live activity or it is the harness saying its own name -- never a session."""
+
+    def test_a_working_agents_activity_survives_and_the_banner_does_not(self):
+        with loaded_relay() as relay:
+            # What a working claude puts there.
+            self.assertEqual(relay.activity_title("fix P0, draft the P1 plan", "claude"),
+                             "fix P0, draft the P1 plan")
+            # What an idle or done one leaves behind. Measured on this host: of nine agent panes,
+            # seven reported no title and the two that did reported exactly this.
+            self.assertEqual(relay.activity_title("Claude Code", "claude"), "")
+            self.assertEqual(relay.activity_title("\u2733 Claude Code", "claude"), "")
+            # Prefix matching, so a new harness needs no entry in a list.
+            self.assertEqual(relay.activity_title("Codex", "codex"), "")
+            self.assertEqual(relay.activity_title("OpenCode", "opencode"), "")
+            self.assertEqual(relay.activity_title(None, "claude"), "")
+            # A title that merely mentions the harness is still a title.
+            self.assertEqual(relay.activity_title("porting the claude reader", "claude"),
+                             "porting the claude reader")
+
+
+class RelaySpacesTests(unittest.TestCase):
+    """`pane list` gives ids; the names, numbering and focus live in workspace/tab list."""
+
+    WORKSPACES = {"result": {"type": "workspace_list", "workspaces": [
+        {"workspace_id": "w1", "label": "herdr-remote", "number": 1, "focused": True,
+         "tab_count": 1, "pane_count": 3, "active_tab_id": "w1:t1", "agent_status": "idle",
+         "worktree": {"repo_name": "herdr-remote", "is_linked_worktree": False}},
+        {"workspace_id": "w2", "label": "kv-tool", "number": 2, "focused": False,
+         "tab_count": 2, "pane_count": 2, "active_tab_id": "w2:t2", "agent_status": "unknown"},
+    ]}}
+    TABS = {"result": {"type": "tab_list", "tabs": [
+        {"tab_id": "w1:t1", "workspace_id": "w1", "label": "1", "number": 1, "focused": True,
+         "pane_count": 3},
+        {"tab_id": "w2:t1", "workspace_id": "w2", "label": "1", "number": 1, "focused": False,
+         "pane_count": 1},
+        {"tab_id": "w2:t2", "workspace_id": "w2", "label": "feat/kv-tool-v2", "number": 2,
+         "focused": False, "pane_count": 1},
+    ]}}
+
+    @classmethod
+    def herdr_stub(cls, *args, remote=None, **kwargs):
+        if args[:2] == ("workspace", "list"):
+            return json.dumps(cls.WORKSPACES)
+        if args[:2] == ("tab", "list"):
+            return json.dumps(cls.TABS)
+        return ""
+
+    def test_labels_numbering_focus_and_the_full_pane_count_come_through(self):
+        with loaded_relay() as relay:
+            with mock.patch.object(relay, "run_herdr", side_effect=self.herdr_stub):
+                spaces = relay.get_all_spaces()
+
+        workspaces = spaces["workspaces"]
+        self.assertEqual([w["workspace_id"] for w in workspaces], ["w1", "w2"])
+        # The name the operator gave the space -- not the basename of some pane's cwd, which is
+        # all a client can guess from `agents`.
+        self.assertEqual(workspaces[0]["label"], "herdr-remote")
+        self.assertEqual(workspaces[0]["number"], 1)
+        self.assertTrue(workspaces[0]["focused"])
+        self.assertEqual(workspaces[0]["repo"], "herdr-remote")
+        # Every pane, not just the agent ones the relay lists: the difference is how much of the
+        # workspace a client still cannot see.
+        self.assertEqual(workspaces[0]["pane_count"], 3)
+        self.assertEqual(workspaces[1]["repo"], "")
+        self.assertEqual([w["host"] for w in workspaces], ["local", "local"])
+        # A renamed tab is the only place that name exists.
+        self.assertEqual([t["label"] for t in spaces["tabs"]], ["1", "1", "feat/kv-tool-v2"])
+        self.assertTrue(spaces["tabs"][0]["focused"])
+
+    def test_a_failed_hierarchy_read_keeps_the_last_good_one(self):
+        """herdr always has a workspace, so an empty list is the CLI failing -- not a client's
+        chip strip going blank until the next tick."""
+        with loaded_relay() as relay:
+            with mock.patch.object(relay, "run_herdr", side_effect=self.herdr_stub):
+                relay.refresh_spaces(force=True)
+            self.assertEqual(len(relay.spaces_cache["workspaces"]), 2)
+            with mock.patch.object(relay, "run_herdr", return_value=""):
+                spaces = relay.refresh_spaces(force=True)
+            self.assertEqual(len(spaces["workspaces"]), 2)
+
+    def test_the_hierarchy_is_not_re_read_on_every_pane_poll(self):
+        with loaded_relay() as relay:
+            with mock.patch.object(relay, "run_herdr", side_effect=self.herdr_stub) as run:
+                for _ in range(relay.SPACES_POLL_INTERVAL):
+                    relay.refresh_spaces()
+                reads = [c.args[:2] for c in run.call_args_list]
+            # One pass of two calls for the whole interval, not one pass per tick.
+            self.assertEqual(reads, [("workspace", "list"), ("tab", "list")])
+
+    def test_a_mutation_refreshes_the_hierarchy_on_the_next_tick(self):
+        with loaded_relay() as relay:
+            with mock.patch.object(relay, "run_herdr", side_effect=self.herdr_stub):
+                relay.refresh_spaces(force=True)
+            relay.mark_spaces_dirty()
+            with mock.patch.object(relay, "run_herdr", side_effect=self.herdr_stub) as run:
+                relay.refresh_spaces()
+                self.assertEqual([c.args[:2] for c in run.call_args_list],
+                                 [("workspace", "list"), ("tab", "list")])
+
+    def test_the_agents_snapshot_carries_the_hierarchy(self):
+        with loaded_relay() as relay:
+            ws = _FakeWebSocket([])
+            with mock.patch.object(relay, "get_all_panes", return_value=([], [])), \
+                 mock.patch.object(relay, "run_herdr", side_effect=self.herdr_stub):
+                asyncio.run(relay.send_current_snapshot(ws))
+            # Not sent[0]: the snapshot opens with `sessions`, so pick the message by type
+            # rather than by position, which would break again the next time one is added.
+            sent = [json.loads(m) for m in ws.sent]
+            payload = next(m for m in sent if m["type"] == "agents")
+        self.assertEqual([w["label"] for w in payload["spaces"]["workspaces"]],
+                         ["herdr-remote", "kv-tool"])
+
+    def test_an_id_that_two_hosts_both_use_is_refused_rather_than_guessed(self):
+        """Every herdr numbers its own workspaces w1, w2, ... so an id alone is not an address."""
+        with loaded_relay() as relay:
+            relay.workspace_remote_map[("local", "w1")] = None
+            relay.workspace_remote_map[("build-box", "w1")] = "build-box"
+            ok, remote, error = relay.resolve_space("workspace", "w1")
+            self.assertFalse(ok)
+            self.assertIn("build-box", error)
+            self.assertIn("host required", error)
+            # With the host named it resolves, and to that host's remote.
+            self.assertEqual(relay.resolve_space("workspace", "w1", "build-box"),
+                             (True, "build-box", ""))
+            self.assertEqual(relay.resolve_space("workspace", "w1", "local"), (True, None, ""))
+            self.assertFalse(relay.resolve_space("workspace", "w9")[0])
+
+    def _run(self, relay, message):
+        ws = _FakeWebSocket([json.dumps(message)])
+        completed = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        with mock.patch.object(relay, "send_current_snapshot", new=mock.AsyncMock()), \
+             mock.patch.object(relay, "run_herdr_result", return_value=completed) as run:
+            asyncio.run(relay.handle_client(ws))
+        calls = [c.args for c in run.call_args_list]
+        return [json.loads(m) for m in ws.sent], calls
+
+    def _relay_with_hierarchy(self, relay):
+        with mock.patch.object(relay, "run_herdr", side_effect=self.herdr_stub):
+            relay.refresh_spaces(force=True)
+
+    def test_focus_routes_by_which_id_the_client_sent(self):
+        with loaded_relay() as relay:
+            self._relay_with_hierarchy(relay)
+            relay.known_panes.add("w1:p1")
+
+            sent, calls = self._run(relay, {"type": "focus", "pane_id": "w1:p1"})
+            # A pane is focused through `agent focus`, which walks up to its tab and workspace.
+            self.assertEqual(calls, [("agent", "focus", "w1:p1")])
+            self.assertEqual(sent[-1], {"type": "command_result", "command": "focus", "ok": True})
+
+            _, calls = self._run(relay, {"type": "focus", "tab_id": "w2:t2"})
+            self.assertEqual(calls, [("tab", "focus", "w2:t2")])
+
+            _, calls = self._run(relay, {"type": "focus", "workspace_id": "w2"})
+            self.assertEqual(calls, [("workspace", "focus", "w2")])
+
+    def test_focus_refuses_ids_it_has_never_seen(self):
+        with loaded_relay() as relay:
+            self._relay_with_hierarchy(relay)
+            for message, expected in (
+                ({"type": "focus", "pane_id": "w9:p9"}, "unknown pane_id"),
+                ({"type": "focus", "tab_id": "w9:t9"}, "unknown tab_id"),
+                ({"type": "focus", "workspace_id": "w9"}, "unknown workspace_id"),
+                ({"type": "focus"}, "pane_id, tab_id or workspace_id required"),
+            ):
+                sent, calls = self._run(relay, message)
+                self.assertEqual(sent[-1], {"type": "error", "message": expected})
+                self.assertEqual(calls, [])
+
+    def test_create_tab_checks_the_workspace_exists_and_targets_its_host(self):
+        with loaded_relay() as relay:
+            self._relay_with_hierarchy(relay)
+            relay.workspace_remote_map[("build-box", "wZ")] = "build-box"
+
+            sent, calls = self._run(relay, {"type": "create_tab", "workspace_id": "made-up"})
+            # Was passed through to the CLI unchecked, which also meant a remote workspace id
+            # created its tab on the relay's own machine.
+            self.assertEqual(sent[-1], {"type": "error", "message": "unknown workspace_id"})
+            self.assertEqual(calls, [])
+
+            ws = _FakeWebSocket([json.dumps({"type": "create_tab", "workspace_id": "wZ"})])
+            completed = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+            with mock.patch.object(relay, "send_current_snapshot", new=mock.AsyncMock()), \
+                 mock.patch.object(relay, "run_herdr_result", return_value=completed) as run:
+                asyncio.run(relay.handle_client(ws))
+            self.assertEqual(run.call_args.kwargs["remote"], "build-box")
+            self.assertEqual(json.loads(ws.sent[-1]), {"type": "tab_created", "ok": True})
+
+    def test_rename_and_close_tab_reach_herdr_at_all(self):
+        """Both messages were sent by the web client and handled by nobody."""
+        with loaded_relay() as relay:
+            self._relay_with_hierarchy(relay)
+
+            sent, calls = self._run(
+                relay, {"type": "rename_tab", "tab_id": "w2:t2", "label": "release prep"})
+            self.assertEqual(calls, [("tab", "rename", "w2:t2", "release prep")])
+            self.assertEqual(sent[-1],
+                             {"type": "command_result", "command": "rename_tab", "ok": True})
+
+            sent, calls = self._run(relay, {"type": "close_tab", "tab_id": "w2:t2"})
+            self.assertEqual(calls, [("tab", "close", "w2:t2")])
+            self.assertEqual(sent[-1],
+                             {"type": "command_result", "command": "close_tab", "ok": True})
+
+    def test_a_label_that_would_be_read_as_a_flag_or_a_newline_is_refused(self):
+        with loaded_relay() as relay:
+            self._relay_with_hierarchy(relay)
+            for label in ("", "   ", "--clear", "-x", "x" * (relay.MAX_LABEL_LEN + 1)):
+                sent, calls = self._run(
+                    relay, {"type": "rename_tab", "tab_id": "w2:t2", "label": label})
+                self.assertEqual(sent[-1]["type"], "error")
+                self.assertEqual(calls, [])
+            # A newline would be written straight into herdr's tab strip.
+            _, calls = self._run(
+                relay, {"type": "rename_tab", "tab_id": "w2:t2", "label": "one\ntwo"})
+            self.assertEqual(calls, [("tab", "rename", "w2:t2", "one two")])
+
+    def test_renaming_an_agent_asks_herdr_instead_of_typing_at_the_agent(self):
+        """The web client used to send `/rename x` as pane text: claude has no such command, so it
+        landed in the composer as literal characters."""
+        with loaded_relay() as relay:
+            relay.known_panes.add("w1:p1")
+            sent, calls = self._run(
+                relay, {"type": "rename_agent", "pane_id": "w1:p1", "label": "reader port"})
+            self.assertEqual(calls, [("agent", "rename", "w1:p1", "reader port")])
+            self.assertEqual(sent[-1],
+                             {"type": "command_result", "command": "rename_agent", "ok": True})
+
+            _, calls = self._run(relay, {"type": "rename_agent", "pane_id": "w1:p1", "clear": True})
+            self.assertEqual(calls, [("agent", "rename", "w1:p1", "--clear")])
+
+            sent, calls = self._run(
+                relay, {"type": "rename_agent", "pane_id": "nope", "label": "x"})
+            self.assertEqual(sent[-1], {"type": "error", "message": "unknown pane_id"})
+            self.assertEqual(calls, [])
+
+
+class RelayShellPaneTests(unittest.TestCase):
+    """Panes with no agent in them.
+
+    Two thirds of the panes on a real herdr host are these -- 20 of 30 here -- and the relay used
+    to drop every one on the floor. Listing them is free; writing to one is arbitrary command
+    execution, which is why HERDR_SHELL_PANES gates the lot.
+    """
+
+    PANE_LIST = json.dumps({"result": {"panes": [
+        {"pane_id": "w1:p1", "agent": "claude", "agent_status": "idle", "cwd": "/work/api",
+         "workspace_id": "w1", "tab_id": "w1:t1", "focused": True,
+         "scroll": {"max_offset_from_bottom": 0, "viewport_rows": 40}},
+        {"pane_id": "w1:p2", "agent_status": "unknown", "cwd": "/work/api",
+         "workspace_id": "w1", "tab_id": "w1:t1", "focused": False,
+         "scroll": {"max_offset_from_bottom": 693, "viewport_rows": 35}},
+        {"pane_id": "w2:p9", "agent_status": "unknown", "cwd": "/srv/logs",
+         "workspace_id": "w2", "tab_id": "w2:t1", "focused": False,
+         "scroll": {"max_offset_from_bottom": 0, "viewport_rows": 24}},
+    ]}})
+
+    def herdr_stub(self, *args, remote=None):
+        if args[:2] == ("pane", "list"):
+            return self.PANE_LIST
+        return ""
+
+    def test_shell_panes_stay_invisible_until_the_switch_is_on(self):
+        """Default off: a relay that gains a remote shell on upgrade would be a nasty surprise."""
+        with loaded_relay() as relay:
+            self.assertFalse(relay.SHELL_PANES)
+            with mock.patch.object(relay, "run_herdr", side_effect=self.herdr_stub):
+                agents, shells = relay.list_panes_from_host()
+            self.assertEqual([a["pane_id"] for a in agents], ["w1:p1"])
+            self.assertEqual(shells, [])
+
+    def test_the_switch_lists_them_without_disturbing_the_agents(self):
+        with loaded_relay(shell_panes="1") as relay:
+            self.assertTrue(relay.SHELL_PANES)
+            with mock.patch.object(relay, "run_herdr", side_effect=self.herdr_stub):
+                agents, shells = relay.list_panes_from_host()
+            self.assertEqual([a["pane_id"] for a in agents], ["w1:p1"])
+            self.assertEqual([s["pane_id"] for s in shells], ["w1:p2", "w2:p9"])
+            first = shells[0]
+            self.assertEqual(first["project"], "api")
+            self.assertEqual(first["tab_id"], "w1:t1")
+            self.assertEqual(first["host"], "local")
+            # The one thing an agent pane never has. A client uses it to decide whether "load
+            # older" can return anything at all.
+            self.assertEqual(first["scrollback"], 693)
+            # None of the agent-only keys, because six clients read `agents` and would render a
+            # shell pane as a harness-less agent card.
+            for absent in ("agent", "status", "has_session", "title"):
+                self.assertNotIn(absent, first)
+
+    def test_only_one_pane_list_serves_both_kinds(self):
+        """The CLI call is the cost -- 12ms locally, an SSH round trip remotely, every poll."""
+        with loaded_relay(shell_panes="1") as relay:
+            with mock.patch.object(relay, "run_herdr", side_effect=self.herdr_stub) as run:
+                relay.list_panes_from_host()
+            calls = [c.args[:2] for c in run.call_args_list]
+            # Exactly one, not "the only call": the same pass also reads `workspace list` for the
+            # workspace_label an agent entry carries. What must not happen is a second `pane list`
+            # because agents and shells were collected separately.
+            self.assertEqual(calls.count(("pane", "list")), 1, calls)
+
+    def test_a_shell_pane_becomes_addressable(self):
+        with loaded_relay(shell_panes="1") as relay:
+            with mock.patch.object(relay, "run_herdr", side_effect=self.herdr_stub):
+                agents, shells = relay.get_all_panes()
+            relay.update_pane_maps(agents, shells)
+            self.assertIn("w1:p2", relay.known_panes)
+            self.assertIn("w1:p2", relay.shell_pane_map)
+            # ...but not as an agent: the blocked-prompt machinery reads agent_cache.
+            self.assertNotIn("w1:p2", relay.agent_cache)
+
+    def test_a_caller_with_no_shell_list_does_not_evict_them(self):
+        """event_push-shaped callers pass agents only; that must not sweep every shell pane."""
+        with loaded_relay(shell_panes="1") as relay:
+            with mock.patch.object(relay, "run_herdr", side_effect=self.herdr_stub):
+                agents, shells = relay.get_all_panes()
+            relay.update_pane_maps(agents, shells)
+            relay.update_pane_maps(agents)
+            self.assertIn("w1:p2", relay.known_panes)
+            self.assertIn("w1:p2", relay.shell_pane_map)
+
+    def test_free_text_runs_as_a_command_on_a_shell_pane(self):
+        """No question to detect, no approval to match: the text is a command and Enter runs it."""
+        with loaded_relay(shell_panes="1") as relay:
+            relay.known_panes.add("w1:p2")
+            relay.shell_pane_map["w1:p2"] = {"pane_id": "w1:p2", "tab_id": "w1:t1"}
+            ws = _FakeWebSocket([json.dumps(
+                {"type": "respond", "pane_id": "w1:p2", "text": "ls -la"})])
+            with mock.patch.object(relay, "send_current_snapshot", new=mock.AsyncMock()), \
+                 mock.patch.object(relay, "read_pane") as read_pane, \
+                 mock.patch.object(relay, "_mutate_herdr", return_value=True) as mutate:
+                asyncio.run(relay.handle_client(ws))
+            self.assertEqual(
+                [c.args for c in mutate.call_args_list],
+                [("pane", "send-text", "w1:p2", "ls -la"),
+                 ("pane", "send-keys", "w1:p2", "Enter")],
+            )
+            # The question path is skipped outright rather than fed shell output and tricked.
+            read_pane.assert_not_called()
+            self.assertTrue(json.loads(ws.sent[-1])["ok"])
+
+    def test_free_text_is_still_refused_on_an_agent_pane(self):
+        """The shell branch must not have opened the agent one."""
+        with loaded_relay(shell_panes="1") as relay:
+            relay.known_panes.add("w1:p1")
+            content = "Approve this tool?"
+            ws = _FakeWebSocket([json.dumps(
+                {"type": "respond", "pane_id": "w1:p1", "text": "rm -rf /",
+                 "prompt_id": relay.question_prompt_id("w1:p1", content)})])
+            with mock.patch.object(relay, "send_current_snapshot", new=mock.AsyncMock()), \
+                 mock.patch.object(relay, "read_pane", return_value=content), \
+                 mock.patch.object(relay, "_mutate_herdr") as mutate:
+                asyncio.run(relay.handle_client(ws))
+            mutate.assert_not_called()
+            self.assertIn("detected question", json.loads(ws.sent[-1])["message"])
+
+    def test_process_info_is_sent_only_when_asked_for(self):
+        """One extra CLI call, so a mirror refresh must not pay it every tick."""
+        info = json.dumps({"result": {"process_info": {"foreground_processes": [
+            {"name": "vim", "cmdline": "vim relay/herdr_relay.py", "pid": 42}]}}})
+
+        def stub(*args, remote=None):
+            return info if args[:2] == ("pane", "process-info") else "output"
+
+        for asked, expected in ((True, "vim"), (False, None)):
+            with self.subTest(process=asked), loaded_relay(shell_panes="1") as relay:
+                relay.known_panes.add("w1:p2")
+                request = {"type": "read_pane", "pane_id": "w1:p2"}
+                if asked:
+                    request["process"] = True
+                ws = _FakeWebSocket([json.dumps(request)])
+                with mock.patch.object(relay, "send_current_snapshot", new=mock.AsyncMock()), \
+                     mock.patch.object(relay, "run_herdr", side_effect=stub) as run:
+                    asyncio.run(relay.handle_client(ws))
+                reply = json.loads(ws.sent[-1])
+                self.assertEqual((reply.get("process") or {}).get("name"), expected)
+                asked_for_it = any(c.args[:2] == ("pane", "process-info")
+                                   for c in run.call_args_list)
+                self.assertEqual(asked_for_it, asked)
+
+
+class RelayPaneWalkTests(unittest.TestCase):
+    """Focusing a pane herdr has no command for."""
+
+    LAYOUT = {
+        "w1:p1": {"x": 0, "y": 0, "width": 120, "height": 70},    # left half
+        "w1:p2": {"x": 120, "y": 0, "width": 120, "height": 35},  # right top
+        "w1:p3": {"x": 120, "y": 35, "width": 120, "height": 35},  # right bottom
+    }
+
+    def layout_json(self, focused):
+        return json.dumps({"result": {"layout": {
+            "focused_pane_id": focused,
+            "panes": [{"pane_id": pid, "focused": pid == focused, "rect": rect}
+                      for pid, rect in self.LAYOUT.items()],
+        }}})
+
+    def test_a_cell_is_taller_than_it_is_wide_so_overlap_picks_the_axis(self):
+        """Raw dx vs dy would call p1 -> p3 a vertical move; they share no rows, so it isn't."""
+        with loaded_relay() as relay:
+            left, right_top, right_bottom = (self.LAYOUT[k] for k in
+                                             ("w1:p1", "w1:p2", "w1:p3"))
+            self.assertEqual(relay.walk_direction(left, right_top), "right")
+            self.assertEqual(relay.walk_direction(right_top, left), "left")
+            self.assertEqual(relay.walk_direction(right_top, right_bottom), "down")
+            self.assertEqual(relay.walk_direction(right_bottom, right_top), "up")
+            # p1 spans every row p3 does, so it is a horizontal neighbour despite the offset.
+            self.assertEqual(relay.walk_direction(left, right_bottom), "right")
+
+    def test_the_walk_focuses_the_tab_then_steps_to_the_pane(self):
+        with loaded_relay(shell_panes="1") as relay:
+            focused = ["w1:p1"]
+
+            def reader(*args, remote=None):
+                return self.layout_json(focused[0]) if args[:2] == ("pane", "layout") else ""
+
+            def mutator(*args, remote=None):
+                if args[:2] == ("pane", "focus"):
+                    focused[0] = {"right": "w1:p2", "down": "w1:p3"}.get(args[3], focused[0])
+                return True
+
+            with mock.patch.object(relay, "run_herdr", side_effect=reader), \
+                 mock.patch.object(relay, "_mutate_herdr", side_effect=mutator) as mutate:
+                self.assertTrue(relay.focus_shell_pane("w1:p3", "w1:t1"))
+
+            calls = [c.args for c in mutate.call_args_list]
+            self.assertEqual(calls[0], ("tab", "focus", "w1:t1"))
+            self.assertEqual([c[3] for c in calls[1:]], ["right", "down"])
+
+    def test_a_step_that_moves_nothing_stops_the_walk(self):
+        """A wall, or a layout walk_direction does not model. Either way: not a loop."""
+        with loaded_relay(shell_panes="1") as relay:
+            def reader(*args, remote=None):
+                return self.layout_json("w1:p1") if args[:2] == ("pane", "layout") else ""
+
+            with mock.patch.object(relay, "run_herdr", side_effect=reader), \
+                 mock.patch.object(relay, "_mutate_herdr", return_value=True) as mutate:
+                self.assertFalse(relay.focus_shell_pane("w1:p3", "w1:t1"))
+            # tab focus, one step, then it notices the step changed nothing.
+            self.assertEqual(len(mutate.call_args_list), 2)
+
+    def test_an_unreadable_layout_fails_rather_than_guesses(self):
+        with loaded_relay(shell_panes="1") as relay:
+            with mock.patch.object(relay, "run_herdr", return_value="not json"), \
+                 mock.patch.object(relay, "_mutate_herdr", return_value=True):
+                self.assertFalse(relay.focus_shell_pane("w1:p3", "w1:t1"))
+
+
+class RelaySshMultiplexingTests(unittest.TestCase):
+    def test_remote_invocations_reuse_one_connection(self):
+        with loaded_relay() as relay:
+            if sys.platform == "win32":
+                self.skipTest("OpenSSH on Windows has no connection multiplexing")
+            args = relay.SSH_BASE_ARGS
+            self.assertIn("ControlMaster=auto", args)
+            self.assertIn("ControlPersist=60s", args)
+            control_path = next(a for a in args if a.startswith("ControlPath="))
+            # %C hashes user/host/port to a fixed width so the socket path stays inside the
+            # ~104-byte AF_UNIX limit.
+            self.assertTrue(control_path.endswith("%C"), control_path)
+            self.assertLess(len(control_path), 104)
+            # Options first, then the target, then the remote binary -- callers index on that.
+            self.assertEqual(args[:4], ["-o", "ConnectTimeout=5", "-o", "BatchMode=yes"])
 
 
 if __name__ == "__main__":

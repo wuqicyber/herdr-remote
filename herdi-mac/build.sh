@@ -4,12 +4,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 APP_NAME="Herdi"
 BUNDLE_ID="com.dcolinmorgan.herdi"
-VERSION="0.7.5"
+VERSION="0.8.0"
 BUILD_DIR="$SCRIPT_DIR/.build/release"
 APP_DIR="$SCRIPT_DIR/dist/$APP_NAME.app"
-
-# Sync version to plugin manifests
-sed -i '' "s/^version = \".*\"/version = \"$VERSION\"/" "$SCRIPT_DIR/../herdr-plugin.toml" "$SCRIPT_DIR/../relay/herdr-plugin.toml" 2>/dev/null || true
 
 echo "▸ Building release..."
 cd "$SCRIPT_DIR"

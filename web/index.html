@@ -2,214 +2,34 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<link rel="manifest" href="data:application/json,{&quot;name&quot;:&quot;herdr-remote&quot;,&quot;short_name&quot;:&quot;herdr&quot;,&quot;display&quot;:&quot;standalone&quot;,&quot;background_color&quot;:&quot;%23e1e2e7&quot;,&quot;theme_color&quot;:&quot;%23e1e2e7&quot;}">
+<meta name="theme-color" content="#f5f5f5" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0a0a0a" media="(prefers-color-scheme: dark)">
+<!-- The pin, before anything paints: someone who chose Dark must not be shown the OS's Light
+     first. Inline because this app is one file with no build step and no CSP to satisfy, and a
+     BARE string rather than JSON -- setTheme writes the same three words, and JSON.stringify
+     would store `"dark"` with the quotes and silently stop this from ever firing. Someone on
+     Auto -- the default -- needs none of it: `color-scheme: light dark` below gets their first
+     paint right with no JavaScript at all. -->
+<script>
+try {
+  var pinned = localStorage.getItem('herdr_theme');
+  if (pinned === 'dark' || pinned === 'light') document.documentElement.dataset.theme = pinned;
+} catch (e) {}  // Safari private mode throws on localStorage; Auto is the right fallback anyway.
+</script>
+<link rel="manifest" href="data:application/json,{&quot;name&quot;:&quot;herdr-remote&quot;,&quot;short_name&quot;:&quot;herdr&quot;,&quot;start_url&quot;:&quot;/&quot;,&quot;display&quot;:&quot;standalone&quot;,&quot;background_color&quot;:&quot;%230a0a0a&quot;,&quot;theme_color&quot;:&quot;%230a0a0a&quot;,&quot;icons&quot;:[{&quot;src&quot;:&quot;/icon-192.png&quot;,&quot;sizes&quot;:&quot;192x192&quot;,&quot;type&quot;:&quot;image/png&quot;},{&quot;src&quot;:&quot;/icon-512.png&quot;,&quot;sizes&quot;:&quot;512x512&quot;,&quot;type&quot;:&quot;image/png&quot;,&quot;purpose&quot;:&quot;any maskable&quot;},{&quot;src&quot;:&quot;/logo.svg&quot;,&quot;sizes&quot;:&quot;any&quot;,&quot;type&quot;:&quot;image/svg+xml&quot;}]}">
+<link rel="icon" type="image/svg+xml" href="/logo.svg">
+<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png">
+<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
 <title>herdr-remote</title>
 <script type="module">
 import { play, bind } from 'https://esm.sh/cuelume@0.1.2';
 window.cue = play;
 document.addEventListener('DOMContentLoaded', () => bind());
 </script>
-<style data-font-face>
-@font-face {
-  font-family: 'Hack Nerd Font';
-  src: url('./HackNerdFont-Regular.woff2') format('woff2');
-  font-weight: 400;
-  font-style: normal;
-  font-display: swap;
-}
-</style>
-<style>
-:root {
-  --bg: #e1e2e7; --surface: #d8d9e0; --border: #b6bbd1; --text: #1f2f66; --muted: #68709a;
-  --green: #587539; --red: #f52a65; --blue: #2e7de9; --orange: #8c6c3e;
-  --term-bg: #1a1b26; --term-text: #c0caf5;
-}
-@media (prefers-color-scheme: dark) {
-  :root {
-    --bg: #1a1b26; --surface: #202331; --border: #2f3549; --text: #c0caf5; --muted: #565f89;
-    --green: #9ece6a; --red: #f7768e; --blue: #7aa2f7; --orange: #e0af68;
-    --term-bg: #1a1b26; --term-text: #c0caf5;
-  }
-}
-
-* { margin: 0; padding: 0; box-sizing: border-box; }
-*:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; border-radius: 4px; }
-/* The page itself never pans sideways. overflow-x on <body> alone does not
-   stop it: the viewport scroller is <html>, and overscroll-behavior keeps a
-   swipe inside .chip-strip or .term-content from rubber-banding the document. */
-html { overflow-x: hidden; overscroll-behavior: none; }
-body { font-family: -apple-system, system-ui, -webkit-system-font, sans-serif; background: var(--bg); color: var(--text); min-height: 100dvh; min-height: -webkit-fill-available; display: flex; flex-direction: column; width: 100%; overflow-x: hidden; overscroll-behavior: none; }
-
-.header { padding: 12px 16px; display: flex; align-items: center; gap: 10px; border-bottom: 1px solid var(--border); position: relative; }
-.header h1 { font-size: 1rem; font-weight: 700; letter-spacing: -0.02em; }
-.header button { background: none; border: none; color: var(--muted); cursor: pointer; padding: 8px; min-width: 44px; min-height: 44px; display: flex; align-items: center; justify-content: center; border-radius: 8px; transition: color 0.15s, background 0.15s; }
-.header button:hover { color: var(--text); background: var(--border); }
-.dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
-.dot.pulse { animation: pulse 2s infinite; }
-@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
-
-.view { flex: 1; overflow-y: auto; }
-
-/* Settings */
-.settings { display: none; padding: 16px; }
-.settings.active { display: block; }
-.settings h2 { font-size: 0.9rem; margin-bottom: 12px; }
-.setting-group { background: var(--surface); border-radius: 10px; padding: 12px; margin-bottom: 12px; }
-.setting-group label { font-size: 0.75rem; color: var(--muted); display: block; margin-bottom: 6px; }
-/* 16px is a floor on every focusable field, not a design choice: iOS Safari
-   zooms the page whenever a focused control is smaller, and the zoom then
-   pans the fixed panes out from under the viewport. Do not lower these. */
-.setting-group input { width: 100%; padding: 8px; border-radius: 6px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size: 16px; }
-.setting-group select { width: 100%; padding: 8px; border-radius: 6px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size: 16px; }
-.setting-group .hint { font-size: 0.65rem; color: var(--muted); margin-top: 4px; }
-.setting-group button { margin-top: 8px; padding: 8px 16px; border-radius: 6px; border: none; background: var(--green); color: #000; font-weight: 600; font-size: 13px; cursor: pointer; }
-
-
-/* Agent list */
-.agents { padding: 12px; }
-.section-header { font-size: 0.7rem; font-weight: 600; letter-spacing: 0.05em; text-transform: uppercase; color: var(--muted); margin: 16px 0 8px; display: flex; align-items: center; gap: 5px; }
-.agent { background: var(--surface); border-radius: 12px; padding: 14px 16px; margin-bottom: 8px; display: flex; align-items: center; gap: 8px; cursor: pointer; border: 1px solid var(--border); transition: transform 0.2s ease, box-shadow 0.2s ease, border-color 0.2s ease; }
-.agent:hover { border-color: color-mix(in srgb, var(--text) 20%, transparent); transform: translateY(-1px); box-shadow: 0 4px 12px rgba(0,0,0,0.1); }
-.agent:active { transform: scale(0.99); box-shadow: none; }
-.agent .dot { width: 10px; height: 10px; }
-.agent.blocked { border-color: var(--red); background: color-mix(in srgb, var(--red) 5%, var(--surface)); }
-.workspace-card { border-color: color-mix(in srgb, var(--text) 10%, transparent); }
-.count-pill { display: inline-block; padding: 1px 6px; border-radius: 4px; background: color-mix(in srgb, var(--text) 8%, transparent); font-size: 0.65rem; }
-.chip-strip { display: flex; align-items: center; gap: 8px; overflow-x: auto; padding: 8px 12px; scrollbar-width: none; -webkit-overflow-scrolling: touch; }
-.chip-strip::-webkit-scrollbar { display: none; }
-.chip-label { font-size: 0.65rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); white-space: nowrap; }
-.chip { padding: 6px 14px; border-radius: 9999px; border: none; font-size: 0.8rem; font-weight: 500; white-space: nowrap; cursor: pointer; position: relative; transition: all 0.15s; background: var(--border); color: var(--muted); }
-.chip.active { background: var(--blue); color: #fff; }
-.chip.alert::after { content: ''; position: absolute; top: -2px; right: -2px; width: 8px; height: 8px; border-radius: 50%; background: var(--red); border: 2px solid var(--bg); }
-.chip:active { transform: scale(0.95); }
-.chip-add { border: 2px dashed var(--border); background: transparent; color: var(--muted); font-size: 1rem; padding: 4px 12px; }
-.chip-add:hover { border-color: var(--blue); color: var(--blue); }
-
-/* Session picker. The wrapper is the positioning context so the menu hangs
-   under the button rather than the header's left edge. */
-.session-picker { position: relative; display: inline-flex; align-items: center; }
-/* Pill styling borrowed from .chip so it reads as a control at rest; the id
-   beats .header button's 44px icon-button sizing. */
-#sessionSelector { min-width: 0; min-height: 0; padding: 5px 12px; border-radius: 9999px; background: var(--border); color: var(--muted); font-size: 0.8rem; font-weight: 500; white-space: nowrap; }
-#sessionSelector:hover { color: var(--text); }
-#sessionSelector:active { transform: scale(0.95); }
-/* 60 sits above .terminal-view (50), which starts below the header and so must
-   not cover a menu hanging off it. Deliberately below #cmdPalette (100) and
-   #contextMenu (200) — those are modals that should cover a dropdown. */
-#sessionMenu { display: none; position: absolute; top: 100%; left: 0; margin-top: 6px; z-index: 60; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 4px; min-width: 160px; font-size: 0.8rem; box-shadow: 0 4px 12px rgba(0,0,0,0.1); }
-#sessionMenu [role="option"] { padding: 6px 8px; border-radius: 6px; cursor: pointer; white-space: nowrap; }
-#sessionMenu [role="option"]:hover { background: var(--border); }
-/* Fixed width so names align whether or not the row is ticked. */
-.session-mark { display: inline-block; width: 1.1em; }
-.agent .info { flex: 1; }
-.agent .project { font-size: 0.9rem; font-weight: 500; }
-.agent .meta { font-size: 0.7rem; color: var(--muted); margin-top: 2px; }
-
-/* Terminal view */
-/* Full-screen on phones: the term-header carries its own back button, so
-   covering the app header buys ~69px of output instead of guessing its height. */
-.terminal-view { display: none; flex-direction: column; position: fixed; inset: 0; background: var(--bg); z-index: 50; }
-.terminal-view.active { display: flex; }
-.term-header { padding: 10px 16px; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
-.term-header .back { background: none; border: none; color: var(--blue); font-size: 1.4rem; cursor: pointer; padding: 4px 8px; }
-.term-header .title { flex: 1; font-size: 0.8rem; font-weight: 500; }
-.term-header .refresh-btn { background: none; border: none; color: var(--muted); font-size: 1.1rem; cursor: pointer; }
-.term-header .search-btn { background: none; border: none; color: var(--muted); cursor: pointer; padding: 4px; }
-.term-header .search-btn:hover, .term-header .refresh-btn:hover, .term-header .history-btn:hover { color: var(--text); }
-.term-header .history-btn { background: none; border: none; color: var(--muted); cursor: pointer; padding: 4px; }
-/* Covers the term-header too — the panel has its own title bar and close
-   button, so there is no header height to line up with. */
-.term-history { position: absolute; inset: 0; background: var(--surface); display: flex; flex-direction: column; z-index: 10; }
-.term-history .msg { padding: 8px 0; border-bottom: 1px solid var(--border); }
-.term-history .msg-role { font-size: 0.7rem; font-weight: 600; color: var(--muted); text-transform: uppercase; margin-bottom: 4px; }
-.term-history .msg-user { color: var(--blue); }
-.term-history .msg-assistant { color: var(--green); }
-.term-history .msg-text { white-space: pre-wrap; word-break: break-word; }
-.term-search { display: flex; align-items: center; gap: 6px; padding: 8px 12px; background: var(--surface); border-bottom: 1px solid var(--border); }
-.term-search input { flex: 1; padding: 6px 10px; border-radius: 6px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size: 16px; }
-.term-search input:focus { outline: none; border-color: var(--blue); }
-.term-search span { font-size: 0.7rem; color: var(--muted); min-width: 40px; text-align: center; }
-.term-search button { background: none; border: none; color: var(--muted); cursor: pointer; padding: 4px; }
-.term-search button:hover { color: var(--text); }
-.search-highlight { background: var(--orange); color: #000; border-radius: 2px; }
-.search-current { background: var(--blue); color: #fff; }
-.ctx-item { display: flex; align-items: center; gap: 10px; padding: 10px 14px; border-radius: 8px; cursor: pointer; color: var(--text); font-size: 0.85rem; }
-.ctx-item:hover { background: var(--border); }
-.ctx-item.danger { color: var(--red); }
-.ctx-item svg { flex-shrink: 0; }
-.session-item { display: flex; align-items: center; gap: 8px; padding: 8px 10px; border-radius: 8px; cursor: pointer; margin-bottom: 4px; background: var(--bg); border: 1px solid var(--border); }
-.session-item:hover { border-color: var(--blue); }
-.session-item.active { border-color: var(--green); background: color-mix(in srgb, var(--green) 10%, var(--bg)); }
-.session-name { font-weight: 500; flex: 1; }
-.session-url { font-size: 0.7rem; color: var(--muted); font-family: monospace; }
-.term-content { flex: 1; min-width: 0; overflow: auto; padding: 10px 12px; background: var(--term-bg); font-family: 'Hack Nerd Font', 'CaskaydiaCove Nerd Font Mono', 'JetBrainsMono Nerd Font Mono', 'SFMono-Regular', Consolas, monospace; font-size: clamp(0.68rem, 2.7vw, 0.8rem); line-height: 1.35; white-space: pre-wrap; overflow-wrap: anywhere; color: var(--term-text); -webkit-overflow-scrolling: touch; overscroll-behavior: contain; }
-.quick-actions { padding: 8px 12px; border-top: 1px solid var(--border); display: flex; gap: 6px; flex-wrap: wrap; flex-shrink: 0; }
-.quick-actions button { padding: 10px 14px; border-radius: 8px; border: none; font-size: 0.8rem; font-weight: 600; cursor: pointer; flex: 1; min-width: 70px; display: flex; align-items: center; justify-content: center; gap: 6px; }
-.btn-yes { background: var(--green); color: #fff; } .btn-trust { background: var(--blue); color: #fff; } .btn-no { background: var(--red); color: #fff; }
-.term-input { border-top: 1px solid var(--border); padding: 8px 12px; display: flex; gap: 6px; background: var(--surface); flex-shrink: 0; }
-.term-input input { flex: 1; padding: 10px; border-radius: 6px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size: 16px; font-family: 'Hack Nerd Font', 'CaskaydiaCove Nerd Font Mono', 'JetBrainsMono Nerd Font Mono', Consolas, monospace; min-width: 0; }
-.term-input button:last-child { padding: 10px 14px; border-radius: 6px; border: none; background: var(--blue); color: #fff; font-weight: 700; font-size: 16px; flex-shrink: 0; }
-.term-keys { border-top: 1px solid var(--border); padding: 8px 12px; display: flex; flex-direction: column; background: var(--surface); flex-shrink: 0; padding-bottom: env(safe-area-inset-bottom, 8px); }
-.nav-key { padding: 10px 4px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size: 13px; font-weight: 500; cursor: pointer; min-height: 44px; display: flex; align-items: center; justify-content: center; transition: background 0.15s, border-color 0.15s; }
-.nav-key:active { background: var(--border); transform: scale(0.97); }
-.mod-key { font-size: 12px; }
-.mod-key.armed { background: var(--blue); border-color: var(--blue); color: #fff; }
-.tab-btn { padding: 8px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--muted); font-size: 12px; font-weight: 600; cursor: pointer; }
-.tab-btn.active { background: var(--surface); color: var(--text); border-color: var(--blue); }
-.ctrl-key { padding: 10px 4px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size: 12px; font-weight: 500; cursor: pointer; min-height: 44px; }
-.ctrl-key:active { background: var(--border); }
-.ctrl-key.danger { color: var(--red); border-color: color-mix(in srgb, var(--red) 30%, var(--border)); }
-.ctrl-key.confirm { background: var(--red); color: #fff; border-color: var(--red); }
-.digit-key { padding: 14px 4px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size: 18px; font-family: monospace; font-weight: 600; cursor: pointer; min-height: 52px; display: flex; align-items: center; justify-content: center; }
-.digit-key:active { background: var(--border); }
-.queue-chip { display: inline-flex; align-items: center; gap: 4px; padding: 4px 8px; border-radius: 6px; border: 1px solid var(--border); background: color-mix(in srgb, var(--text) 5%, var(--bg)); font-family: monospace; font-size: 12px; font-weight: 500; cursor: pointer; }
-.queue-chip:hover { border-color: var(--red); }
-.queue-chip.danger { border-color: color-mix(in srgb, var(--red) 40%, var(--border)); color: var(--red); }
-
-.empty { text-align: center; color: var(--muted); padding: 60px 20px; font-size: 0.85rem; }
-
-/* Terminal output stops wrapping once ~80 columns fit, which happens well
-   before the desktop layout breakpoint: the clamp() above pins the font at
-   12.8px past 474px, so 80 columns need ~641px of content box. Tablets in
-   portrait (iPad mini is 744px) therefore keep alignment and scroll, while
-   phones and iPad Split View (~507px) still wrap. */
-@media (min-width: 640px) {
-  .term-content { white-space: pre; overflow-wrap: normal; }
-}
-
-/* Desktop */
-@media (min-width: 768px) {
-  /* Bound the shell so .view / .terminal-view scroll internally instead of
-     growing the page — what their flex:1 + overflow-y:auto already assumed. */
-  body { max-width: 960px; margin: 0 auto; padding: 0 16px; height: 100dvh; }
-  /* relative, not static: .term-history anchors to this. flex instead of a
-     calc() against a hardcoded header height. */
-  .terminal-view { position: relative; display: none; }
-  .terminal-view.active { display: flex; flex: 1; min-height: 0; }
-  .agents { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 12px; }
-  .section-header { grid-column: 1 / -1; }
-  .chip-strip { grid-column: 1 / -1; }
-  .term-content { min-height: 400px; }
-}
-@media (min-width: 1200px) {
-  body { max-width: 1100px; }
-  .agents { grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); }
-}
-@media (max-width: 380px) {
-  .header { padding: 10px 12px; }
-  .header h1 { font-size: 0.9rem; }
-  .agents { padding: 8px; }
-  .agent { padding: 12px; }
-  .term-input { padding: 6px 8px; gap: 4px; }
-  .term-keys { padding: 6px 8px; }
-}
-@media (pointer: fine) {
-  .quick-actions button { flex: none; min-width: auto; padding: 8px 18px; }
-}
-</style>
+<link rel="stylesheet" href="app.css">
 </head>
 <body>
 
@@ -229,6 +49,15 @@ body { font-family: -apple-system, system-ui, -webkit-system-font, sans-serif; b
 
 <div class="settings" id="settingsView">
   <h2>Settings</h2>
+  <div class="setting-group">
+    <label id="themeLabel">Appearance</label>
+    <div class="theme-seg" role="radiogroup" aria-labelledby="themeLabel">
+      <button type="button" role="radio" data-theme-choice="auto" aria-checked="true" onclick="setTheme('auto')">Auto</button>
+      <button type="button" role="radio" data-theme-choice="light" aria-checked="false" onclick="setTheme('light')">Light</button>
+      <button type="button" role="radio" data-theme-choice="dark" aria-checked="false" onclick="setTheme('dark')">Dark</button>
+    </div>
+    <div class="hint">Auto follows the system. <span id="themeResolved"></span></div>
+  </div>
   <div class="setting-group">
     <label for="relayUrl">Relay URL</label>
     <input id="relayUrl" type="url" placeholder="wss://your-tunnel.trycloudflare.com" />
@@ -269,16 +98,34 @@ body { font-family: -apple-system, system-ui, -webkit-system-font, sans-serif; b
   <div class="term-header">
     <button class="back" onclick="closeTerminal()" aria-label="Back to agent list"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 18-6-6 6-6"/></svg></button>
     <span class="title" id="termTitle"></span>
-    <button class="search-btn" onclick="toggleSearch()" aria-label="Find in output"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg></button>
-    <button class="history-btn" onclick="toggleHistory()" aria-label="Conversation history"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l4 2"/></svg></button>
-    <button class="refresh-btn" onclick="refreshPane()" aria-label="Refresh pane"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/><path d="M16 16h5v5"/></svg></button>
+    <button class="search-btn icon-toggle" id="searchBtn" aria-pressed="false" onclick="toggleSearch()" aria-label="Find in output"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg></button>
+    <button class="history-btn icon-toggle" id="historyBtn" aria-pressed="false" onclick="toggleHistory()" aria-label="Conversation history"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l4 2"/></svg></button>
+    <button class="refresh-btn" onclick="followPane()" aria-label="Refresh pane"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/><path d="M16 16h5v5"/></svg></button>
+  </div>
+  <!-- space > tab > pane, the same three levels herdr itself has, in ONE row that can say two of
+       them from inside a session. Both groups are built by renderSiblings as DOM nodes, and each is
+       hidden on its own when it holds no choice: the tabs unless the space has two REACHABLE tabs
+       (6 of 10 agent panes on the measured host sit in a single-tab space), the panes unless the
+       tab holds a second pane (10 of 10 do there, so that group is the one that always shows).
+       When neither has anything to say the row itself goes, border and all.
+       The space above them is the one level left to the herd list, which is a tap on Back. -->
+  <div class="term-sibs" id="termSibs" style="display:none">
+    <div class="term-siblings" id="termTabs" aria-label="Tabs in this space" style="display:none"></div>
+    <span class="sib-sep" id="termSibSep" style="display:none"></span>
+    <div class="term-siblings" id="termSiblings" aria-label="Panes in this tab" style="display:none"></div>
   </div>
   <div class="term-history" id="termHistory" style="display:none">
-    <div style="padding:8px 12px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:8px">
-      <span style="font-size:0.8rem;font-weight:600;flex:1">Conversation History</span>
-      <button onclick="toggleHistory()" style="background:none;border:none;color:var(--muted);cursor:pointer"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
+    <div class="hist-bar">
+      <!-- The title and the filter share this slot: exactly one of them is in the flow at a time,
+           which is what keeps the header one row tall in both states. -->
+      <span class="hist-title" id="historyTitle">Conversation History</span>
+      <input class="hist-find" id="historyFind" type="text" placeholder="Filter loaded turns..." autocomplete="off" oninput="renderHistory()" style="display:none" />
+      <span class="hist-count" id="historyCount"></span>
+      <button class="hist-toggle" id="historyFindBtn" aria-pressed="false" onclick="toggleHistoryFind()" title="Filter loaded turns">Find</button>
+      <button class="hist-toggle" id="historyToolsBtn" aria-pressed="true" onclick="toggleHistoryTools()" title="Show tool calls">Tools</button>
+      <button class="hist-close" onclick="toggleHistory()" aria-label="Close history"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
     </div>
-    <div id="historyContent" style="flex:1;overflow-y:auto;padding:12px;font-size:0.8rem;line-height:1.5"></div>
+    <div class="hist-body" id="historyContent"></div>
   </div>
   <div class="term-search" id="termSearch" style="display:none">
     <input id="searchInput" type="text" placeholder="Find in output..." autocomplete="off" oninput="doSearch()" />
@@ -290,46 +137,41 @@ body { font-family: -apple-system, system-ui, -webkit-system-font, sans-serif; b
   <div class="term-content" id="termContent">Loading…</div>
   <div class="quick-actions" id="quickActions"></div>
   <div class="term-input">
-    <button onclick="openCommandPalette()" aria-label="Commands" style="padding:10px 12px;border-radius:6px;border:1px solid var(--blue);background:var(--bg);color:var(--blue);font-weight:700;font-size:14px;flex-shrink:0">/</button>
+    <button class="term-cmd" onclick="openCommandPalette()" aria-label="Commands">/</button>
     <input id="termInput" placeholder="Type…" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" />
-    <button onclick="toggleQuickDock()" aria-label="Quick actions" style="padding:8px 10px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:var(--orange);flex-shrink:0"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2 3 14h9l-1 8 10-12h-9l1-8z"/></svg></button>
-    <button onclick="toggleKeysDock()" aria-label="Keys" style="padding:8px 10px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:var(--muted);flex-shrink:0"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="M6 8h.001M10 8h.001M14 8h.001M18 8h.001M8 12h.001M12 12h.001M16 12h.001M7 16h10"/></svg></button>
-    <button onclick="sendText()" aria-label="Send" style="padding:10px 14px;border-radius:6px;border:none;background:var(--blue);color:#fff;flex-shrink:0"><svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" stroke="none"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg></button>
+    <button class="dock-toggle dock-quick" id="quickDockBtn" aria-pressed="false" onclick="toggleQuickDock()" aria-label="Quick actions"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2 3 14h9l-1 8 10-12h-9l1-8z"/></svg></button>
+    <button class="dock-toggle dock-keys" id="keysDockBtn" aria-pressed="false" onclick="toggleKeysDock()" aria-label="Keys"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="M6 8h.001M10 8h.001M14 8h.001M18 8h.001M8 12h.001M12 12h.001M16 12h.001M7 16h10"/></svg></button>
+    <button class="term-send" onclick="sendText()" aria-label="Send"><svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" stroke="none"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg></button>
   </div>
   <div class="term-keys" id="termKeys" style="display:none">
     <!-- Key queue strip (visible when composing) -->
     <div id="keyQueueStrip" style="display:none;width:100%;padding:6px 0;border-bottom:1px solid var(--border);margin-bottom:6px;flex-wrap:wrap;gap:4px;align-items:center"></div>
-    <!-- Tab toggle -->
-    <div style="display:grid;grid-template-columns:1fr 1fr;gap:4px;width:100%;margin-bottom:6px">
-      <button class="tab-btn active" id="tabKeys" onclick="switchKeyTab('keys')">Keys</button>
-      <button class="tab-btn" id="tabDigits" onclick="switchKeyTab('digits')">123</button>
+    <!-- Pad switch and the presets disclosure share one line -->
+    <div class="keys-bar">
+      <button class="tab-btn" id="tabKeys" aria-pressed="true" onclick="switchKeyTab('keys')">Keys</button>
+      <button class="tab-btn" id="tabDigits" aria-pressed="false" onclick="switchKeyTab('digits')">123</button>
+      <button class="presets-btn" id="presetsBtn" aria-pressed="false" onclick="toggleCtrlPresets()">Presets <span id="ctrlChevron">▸</span></button>
     </div>
     <!-- Keys pad -->
     <div id="keysPad" style="width:100%">
-      <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:4px;margin-bottom:4px">
-        <button class="nav-key" onclick="fireKey('Escape')">Esc</button>
-        <button class="nav-key" style="grid-column:span 2" onclick="fireKey('Space')">Space</button>
-        <button class="nav-key" onclick="fireKey('Enter')">⏎ Enter</button>
+      <div class="keys-grid">
+        <button class="nav-key" style="grid-area:esc" onclick="fireKey('Escape')">Esc</button>
+        <button class="nav-key" style="grid-area:space" onclick="fireKey('Space')">Space</button>
+        <button class="nav-key" style="grid-area:pgup" onclick="fireKey('PageUp')">PgUp</button>
+        <button class="nav-key" style="grid-area:up" onclick="fireKey('Up')">↑</button>
+        <button class="nav-key" style="grid-area:tab" onclick="fireKey('Tab')">Tab</button>
+        <button class="nav-key" style="grid-area:enter;flex-direction:column;gap:1px" onclick="fireKey('Enter')">⏎<span style="font-size:9px;opacity:0.75">Enter</span></button>
+        <button class="nav-key mod-key" style="grid-area:ctrl" id="modCtrl" onclick="armMod('ctrl')">Ctrl</button>
+        <button class="nav-key mod-key" style="grid-area:shift" id="modShift" onclick="armMod('shift')">⇧</button>
+        <button class="nav-key" style="grid-area:pgdn" onclick="fireKey('PageDown')">PgDn</button>
+        <button class="nav-key" style="grid-area:left" onclick="fireKey('Left')">←</button>
+        <button class="nav-key" style="grid-area:down" onclick="fireKey('Down')">↓</button>
+        <button class="nav-key" style="grid-area:right" onclick="fireKey('Right')">→</button>
       </div>
-      <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:4px;margin-bottom:4px">
-        <button class="nav-key" onclick="fireKey('Tab')">Tab</button>
-        <button class="nav-key" onclick="fireKey('Left')">←</button>
-        <button class="nav-key" onclick="fireKey('Down')">↓</button>
-        <button class="nav-key" onclick="fireKey('Up')">↑</button>
-      </div>
-      <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:4px;margin-bottom:4px">
-        <button class="nav-key" onclick="fireKey('Right')">→</button>
-        <button class="nav-key mod-key" id="modShift" onclick="armMod('shift')">⇧ Shift</button>
-        <button class="nav-key mod-key" id="modCtrl" onclick="armMod('ctrl')">Ctrl</button>
-      </div>
-      <!-- Ctrl presets -->
-      <div>
-        <button onclick="toggleCtrlPresets()" style="background:none;border:none;color:var(--muted);font-size:0.7rem;cursor:pointer;padding:2px 4px;font-weight:600;letter-spacing:0.05em;text-transform:uppercase">Presets <span id="ctrlChevron">▸</span></button>
-        <div id="ctrlPresets" style="display:none;grid-template-columns:repeat(3,1fr);gap:4px;margin-top:4px"></div>
-      </div>
+      <div id="ctrlPresets" style="display:none;grid-template-columns:repeat(4,1fr);gap:4px;margin-top:4px"></div>
     </div>
     <!-- Digits pad -->
-    <div id="digitsPad" style="display:none;width:100%;grid-template-columns:repeat(3,1fr);gap:4px"></div>
+    <div id="digitsPad" style="display:none;width:100%;grid-template-columns:repeat(9,1fr);gap:3px"></div>
     <!-- Action keys for blocked state -->
     <div id="actionKeys" style="width:100%;margin-top:4px"></div>
   </div>
@@ -339,19 +181,13 @@ body { font-family: -apple-system, system-ui, -webkit-system-font, sans-serif; b
       <span style="font-size:0.7rem;font-weight:600;text-transform:uppercase;letter-spacing:0.05em;color:var(--muted)">Quick Actions</span>
       <button onclick="toggleQuickDock()" aria-label="Close" style="background:none;border:none;color:var(--muted);font-size:1rem;cursor:pointer">✕</button>
     </div>
-    <div style="width:100%">
-      <p style="font-size:0.6rem;text-transform:uppercase;letter-spacing:0.05em;color:var(--muted);margin-bottom:4px">Confirm</p>
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:4px;margin-bottom:8px">
-        <button class="nav-key" style="color:var(--green);border-color:var(--green)" onclick="quickSend('yes')">yes</button>
-        <button class="nav-key" style="color:var(--red);border-color:var(--red)" onclick="quickSend('no')">no</button>
-      </div>
-      <p style="font-size:0.6rem;text-transform:uppercase;letter-spacing:0.05em;color:var(--muted);margin-bottom:4px">Common</p>
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:4px">
-        <button class="nav-key" onclick="quickSend('continue')">continue</button>
-        <button class="nav-key" onclick="quickSend('retry')">retry</button>
-        <button class="nav-key" onclick="quickSend('skip')">skip</button>
-        <button class="nav-key" onclick="quickSend('commit and push')">commit & push</button>
-      </div>
+    <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:4px;width:100%">
+      <button class="nav-key" style="color:var(--green);border-color:var(--green)" onclick="quickSend('yes')">yes</button>
+      <button class="nav-key" style="color:var(--red);border-color:var(--red)" onclick="quickSend('no')">no</button>
+      <button class="nav-key" onclick="quickSend('continue')">continue</button>
+      <button class="nav-key" onclick="quickSend('retry')">retry</button>
+      <button class="nav-key" onclick="quickSend('skip')">skip</button>
+      <button class="nav-key" onclick="quickSend('commit and push')">commit&nbsp;&amp;&nbsp;push</button>
     </div>
   </div>
 </div>
@@ -364,1250 +200,25 @@ body { font-family: -apple-system, system-ui, -webkit-system-font, sans-serif; b
 
 <div id="cmdPalette" style="display:none;position:fixed;inset:0;z-index:100;">
   <div onclick="closePalette()" style="position:absolute;inset:0;background:rgba(0,0,0,0.5)"></div>
-  <div style="position:absolute;bottom:0;left:50%;transform:translateX(-50%);width:100%;max-width:420px;max-height:50dvh;background:var(--surface);border-top-left-radius:16px;border-top-right-radius:16px;border-top:1px solid var(--border);display:flex;flex-direction:column;padding-bottom:env(safe-area-inset-bottom,8px)">
+  <div style="position:absolute;bottom:0;left:50%;transform:translateX(-50%);width:100%;max-width:420px;max-height:50dvh;background:var(--surface);border-top-left-radius:16px;border-top-right-radius:16px;border-top:1px solid var(--border);display:flex;flex-direction:column;padding-bottom:calc(8px + env(safe-area-inset-bottom,0px))">
     <div style="padding:12px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:8px">
       <span style="font-size:0.8rem;font-weight:600;flex:1">Commands</span>
       <button onclick="closePalette()" aria-label="Close" style="background:none;border:none;color:var(--muted);font-size:1.2rem;cursor:pointer">✕</button>
     </div>
-    <input id="cmdSearch" type="text" placeholder="Search commands…" autocomplete="off" autocorrect="off" style="margin:8px 12px;padding:10px;border-radius:8px;border:1px solid var(--border);background:var(--bg);color:var(--text);font-size:16px" oninput="filterCommands()" />
+    <input id="cmdSearch" type="text" placeholder="Search commands…" autocomplete="off" autocorrect="off" style="margin:8px 12px;padding:10px;border-radius:8px;border:1px solid var(--border);background:var(--bg);color:var(--text);font-size:14px" oninput="filterCommands()" />
     <div id="cmdList" style="overflow-y:auto;padding:4px 12px;"></div>
   </div>
 </div>
 
-<script>
-
-let ws = null, agents = [], activePane = null, refreshInterval = null, userScrolledUp = false;
-let timeline = [], prevStatuses = {};
-let activeWorkspace = null;
-let activeTab = null;
-
-// Settings — auto-detect relay when served from same origin
-const autoRelayUrl = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host;
-const DEMO_RELAY = 'wss://herdr-remote-demo.yyrzrh5wfg.workers.dev';
-const isDemo = location.hostname.includes('herdr-demo.pages.dev');
-const isSelfRelay = !isDemo && !location.hostname.includes('pages.dev') && !location.hostname.includes('localhost');
-const savedUrl = localStorage.getItem('herdr_relay_url') || (isSelfRelay ? autoRelayUrl : (isDemo ? DEMO_RELAY : ''));
-const urlToken = new URLSearchParams(location.search).get('token');
-if (urlToken) localStorage.setItem('herdr_relay_token', urlToken);
-const savedToken = localStorage.getItem('herdr_relay_token') || '';
-document.getElementById('relayUrl').value = savedUrl;
-document.getElementById('relayToken').value = savedToken;
-
-
-
-function toggleSettings() {
-  const s = document.getElementById('settingsView');
-  const show = s.style.display !== 'block';
-  s.style.display = show ? 'block' : 'none';
-  document.getElementById('agentListView').style.display = show ? 'none' : '';
-  document.getElementById('timelineView').style.display = 'none';
-  if (show) {
-    document.getElementById('settingsStatus').innerHTML = ws && ws.readyState === 1
-      ? `<span style="color:var(--green)">● Connected</span> · ${agents.length} agents`
-      : `<span style="color:var(--red)">● Disconnected</span>`;
-    renderSessions();
-  }
-}
-
-function toggleTimeline() {
-  const t = document.getElementById('timelineView');
-  const show = t.style.display !== 'block';
-  t.style.display = show ? 'block' : 'none';
-  document.getElementById('agentListView').style.display = show ? 'none' : '';
-  document.getElementById('settingsView').style.display = 'none';
-  if (show) renderTimeline();
-}
-
-function renderTimeline() {
-  const el = document.getElementById('timelineList');
-  if (!timeline.length) { el.innerHTML = '<p style="color:var(--muted);text-align:center;padding:40px">No activity yet. Status changes appear here.</p>'; return; }
-  el.innerHTML = timeline.map(e => {
-    const t = e.time.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
-    const color = e.status==='blocked'?'var(--red)':e.status==='working'?'var(--green)':'var(--muted)';
-    return `<div style="display:flex;gap:8px;padding:4px 0;border-bottom:1px solid var(--border)"><span style="color:var(--muted)">${t}</span><span style="flex:1">${e.project} (${e.agent})</span><span style="color:${color}">${e.status}</span></div>`;
-  }).join('');
-}
-
-function saveAndConnect() {
-  const url = document.getElementById('relayUrl').value.trim();
-  if (!url) return;
-  localStorage.setItem('herdr_relay_url', url);
-  const token = document.getElementById('relayToken').value.trim();
-  if (token) localStorage.setItem('herdr_relay_token', token);
-  else localStorage.removeItem('herdr_relay_token');
-  connect();
-  toggleSettings();
-}
-
-// Session switcher
-function getSessions() {
-  try { return JSON.parse(localStorage.getItem('herdr_sessions') || '[]'); }
-  catch { return []; }
-}
-
-function saveSessions(sessions) {
-  localStorage.setItem('herdr_sessions', JSON.stringify(sessions));
-}
-
-function saveCurrentSession() {
-  const url = document.getElementById('relayUrl').value.trim();
-  if (!url) { alert('Enter a relay URL first'); return; }
-  const name = prompt('Session name:', new URL(url).hostname || 'Session');
-  if (!name) return;
-  const sessions = getSessions();
-  const existing = sessions.findIndex(s => s.url === url);
-  if (existing >= 0) {
-    sessions[existing].name = name;
-  } else {
-    sessions.push({ name, url, token: document.getElementById('relayToken').value.trim() || '' });
-  }
-  saveSessions(sessions);
-  renderSessions();
-  if (window.cue) cue('success');
-}
-
-function switchSession(idx) {
-  const sessions = getSessions();
-  const s = sessions[idx];
-  if (!s) return;
-  document.getElementById('relayUrl').value = s.url;
-  document.getElementById('relayToken').value = s.token || '';
-  saveAndConnect();
-}
-
-function deleteSession(idx, e) {
-  e.stopPropagation();
-  const sessions = getSessions();
-  if (confirm(`Delete "${sessions[idx]?.name}"?`)) {
-    sessions.splice(idx, 1);
-    saveSessions(sessions);
-    renderSessions();
-  }
-}
-
-function renderSessions() {
-  const sessions = getSessions();
-  const el = document.getElementById('sessionList');
-  if (!sessions.length) {
-    el.innerHTML = '<div style="font-size:0.75rem;color:var(--muted)">No saved sessions</div>';
-    return;
-  }
-  const currentUrl = localStorage.getItem('herdr_relay_url') || '';
-  el.innerHTML = sessions.map((s, i) => `
-    <div class="session-item${s.url === currentUrl ? ' active' : ''}" onclick="switchSession(${i})">
-      <span class="session-name">${s.name}</span>
-      <span class="session-url">${new URL(s.url).hostname}</span>
-      <button onclick="deleteSession(${i}, event)" aria-label="Delete" style="background:none;border:none;color:var(--muted);cursor:pointer;padding:4px">×</button>
-    </div>
-  `).join('');
-}
-
-// Connection
-function connect() {
-  let url = localStorage.getItem('herdr_relay_url') || (isSelfRelay ? autoRelayUrl : (isDemo ? DEMO_RELAY : ''));
-  if (!url) { showSetup(); return; }
-  if (ws) ws.close();
-  setStatus('connecting');
-  // Append token as query param if stored separately
-  const token = localStorage.getItem('herdr_relay_token');
-  let wsUrl = url;
-  if (token) wsUrl += (url.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(token);
-  ws = new WebSocket(wsUrl);
-  ws.onopen = () => { setStatus('connected'); if(window.cue) cue('ready'); };
-  ws.onclose = () => { setStatus('disconnected'); setTimeout(connect, 3000); };
-  ws.onerror = () => setStatus('disconnected');
-  ws.onmessage = (e) => handleMessage(JSON.parse(e.data));
-}
-
-function setStatus(s) {
-  const dot = document.getElementById('statusDot');
-  const label = document.getElementById('connLabel');
-  dot.style.background = s==='connected'?'var(--green)':s==='connecting'?'var(--orange)':'var(--red)';
-  label.textContent = s==='connected'?'live':s==='connecting'?'connecting…':'offline';
-  label.style.color = s==='connected'?'var(--green)':s==='connecting'?'var(--orange)':'var(--red)';
-}
-
-function showSetup() {
-  document.getElementById('agents').innerHTML = `<div class="empty">
-    <p style="font-size:1.5rem;margin-bottom:12px">🐑</p>
-    <p><strong>herdr-remote</strong></p>
-    <p style="margin-top:8px">Monitor & approve agents from your phone</p>
-    <p style="margin-top:16px"><button onclick="tryDemo()" style="padding:10px 20px;border-radius:8px;border:none;background:var(--blue);color:#fff;font-weight:600;font-size:0.85rem;cursor:pointer">Try Demo</button></p>
-    <p style="margin-top:16px;font-size:0.75rem;color:var(--muted);text-align:left;max-width:280px;margin-left:auto;margin-right:auto">
-      <strong>Connect your own:</strong><br>
-      1. Run: <code style="font-size:0.7rem">cd relay && ./start.sh</code><br>
-      2. Tap ⚙ → paste the wss:// URL<br>
-    </p>
-  </div>`;
-}
-function tryDemo() {
-  localStorage.setItem('herdr_relay_url', 'wss://herdr-remote-demo.yyrzrh5wfg.workers.dev');
-  localStorage.removeItem('herdr_relay_token');
-  document.getElementById('relayUrl').value = 'wss://herdr-remote-demo.yyrzrh5wfg.workers.dev';
-  connect();
-}
-
-const ANSI_COLORS = ['#000000','#cd3131','#0dbc79','#e5e510','#2472c8','#bc3fbc','#11a8cd','#e5e5e5','#666666','#f14c4c','#23d18b','#f5f543','#3b8eea','#d670d6','#29b8db','#ffffff'];
-
-function ansiFragment(input) {
-  const fragment=document.createDocumentFragment();
-  let state={fg:null,bg:null,inverse:false,hidden:false,fontWeight:'',opacity:'',fontStyle:'',textDecoration:'',textDecorationStyle:''};
-  let cursor=0;
-  const control=/\x1b\]([^\x07\x1b]*)(?:\x07|\x1b\\)|\x1b\[([0-?]*)([ -/]*[@-~])/g;
-  const append=text=>{
-    if(!text)return;
-    const span=document.createElement('span');
-    span.textContent=text;
-    if(state.hidden)span.style.visibility='hidden';
-    const defaultFg='#ccc';
-    const defaultBg='#000';
-    const fg=state.inverse?(state.bg||defaultBg):state.fg;
-    const bg=state.inverse?(state.fg||defaultFg):state.bg;
-    if(fg)span.style.color=fg;
-    if(bg)span.style.backgroundColor=bg;
-    if(state.fontWeight)span.style.fontWeight=state.fontWeight;
-    if(state.opacity)span.style.opacity=state.opacity;
-    if(state.fontStyle)span.style.fontStyle=state.fontStyle;
-    if(state.textDecoration)span.style.textDecoration=state.textDecoration;
-    if(state.textDecorationStyle)span.style.textDecorationStyle=state.textDecorationStyle;
-    fragment.appendChild(span);
-  };
-  for(const match of input.matchAll(control)){
-    append(input.slice(cursor,match.index));
-    cursor=match.index+match[0].length;
-    if(match[3]!=='m')continue;
-    const fields=(match[2]||'0').split(';');
-    const params=fields.map(value=>Number((value.split(':',1)[0])||0));
-    for(let i=0;i<params.length;i++){
-      const code=params[i];
-      if(code===0){state={fg:null,bg:null,inverse:false,hidden:false,fontWeight:'',opacity:'',fontStyle:'',textDecoration:'',textDecorationStyle:''};continue;}
-      if(code===1){state.fontWeight='700';continue;}
-      if(code===2){state.opacity='0.7';continue;}
-      if(code===3){state.fontStyle='italic';continue;}
-      if(code===4){state.textDecoration='underline';continue;}
-      if(code===7){state.inverse=true;continue;}
-      if(code===8){state.hidden=true;continue;}
-      if(code===22){state.fontWeight='';state.opacity='';continue;}
-      if(code===23){state.fontStyle='';continue;}
-      if(typeof fields[i]==='string'&&fields[i].startsWith('4:')){
-        const underlineStyle=fields[i].split(':')[1];
-        state.textDecoration='underline';
-        state.textDecorationStyle=underlineStyle==='2'?'double':underlineStyle==='3'?'wavy':underlineStyle==='4'?'dotted':underlineStyle==='5'?'dashed':'solid';
-        continue;
-      }
-      if(code===24){state.textDecoration='';state.textDecorationStyle='';continue;}
-      if(code===27){state.inverse=false;continue;}
-      if(code===28){state.hidden=false;continue;}
-      if(code===39){state.fg=null;continue;}
-      if(code===49){state.bg=null;continue;}
-      if(code>=30&&code<=37){state.fg=ANSI_COLORS[code-30];continue;}
-      if(code>=90&&code<=97){state.fg=ANSI_COLORS[code-82];continue;}
-      if(code>=40&&code<=47){state.bg=ANSI_COLORS[code-40];continue;}
-      if(code>=100&&code<=107){state.bg=ANSI_COLORS[code-92];continue;}
-      if((code===38||code===48)&&params[i+1]===5&&Number.isInteger(params[i+2])){
-        const n=params[i+2];
-        const color=n<16?ANSI_COLORS[n]:n<232?`rgb(${[0,1,2].map(axis=>{const v=Math.floor((n-16)/Math.pow(6,2-axis))%6;return v?55+v*40:0}).join(',')})`:`rgb(${8+(n-232)*10},${8+(n-232)*10},${8+(n-232)*10})`;
-        state[code===38?'fg':'bg']=color;i+=2;continue;
-      }
-      if((code===38||code===48)&&params[i+1]===2&&params.slice(i+2,i+5).every(Number.isFinite)){
-        state[code===38?'fg':'bg']=`rgb(${params[i+2]},${params[i+3]},${params[i+4]})`;i+=4;
-      }
-    }
-  }
-  append(input.slice(cursor));
-  return fragment;
-}
-
-function handleMessage(msg) {
-  if (msg.type === 'sessions') {
-    sessionState = msg;
-    renderSessionSelector();
-    return;
-  }
-  if (msg.type === 'error') {
-    // A rejected session_switch must not leave the UI stuck on
-    // "switching…" forever. Minimum handling only: no toast UI, since
-    // nothing else in this file renders errors.
-    switchingSession = false;
-    // respond delivers allowlisted answers, plus free text on a pane whose
-    // question the relay can drive itself. Where it can drive neither, type
-    // into the pane instead: send_text has no allowlist of its own, so the
-    // only thing given up is the staleness check respond just performed.
-    // No Enter afterwards -- a blocked pane may be a multi-select, where
-    // Enter toggles the row under the cursor instead of submitting.
-    if (pendingFreeText && msg.message === 'free-text response requires a detected question') {
-      ws.send(JSON.stringify({type:'send_text', pane_id:pendingFreeText.pane_id, text:pendingFreeText.text}));
-      setTimeout(refreshPane, 500);
-    }
-    pendingFreeText = null;
-    render();
-    return;
-  }
-  if (msg.type === 'agents') {
-    switchingSession = false;
-    // Track timeline on status changes
-    for (const a of msg.agents) {
-      const prev = prevStatuses[a.pane_id];
-      if (prev && prev !== a.status) {
-        timeline.unshift({project: a.project, agent: a.agent, status: a.status, time: new Date()});
-        if (timeline.length > 100) timeline.pop();
-      }
-      prevStatuses[a.pane_id] = a.status;
-    }
-    const previousAgents = new Map(agents.map(agent => [agent.pane_id, agent]));
-    agents = msg.agents.map(agent => {
-      const previous = previousAgents.get(agent.pane_id);
-      if (agent.status !== 'blocked' || !previous) return agent;
-      return {
-        ...agent,
-        prompt: previous.prompt,
-        options: previous.options,
-        multi_options: previous.multi_options,
-        interaction: previous.interaction,
-        multi: previous.multi,
-        prompt_id: previous.prompt_id,
-        selected_options: previous.selected_options,
-      };
-    });
-    render();
-  }
-  else if (msg.type === 'agent_update') {
-    const update = msg.agent;
-    if (!update || !update.pane_id) return;
-    const existing = agents.find(a => a.pane_id === update.pane_id);
-    const previousStatus = existing?.status || prevStatuses[update.pane_id];
-    if (existing) Object.assign(existing, update);
-    else agents.push({...update});
-    if (previousStatus && previousStatus !== update.status) {
-      timeline.unshift({project: update.project, agent: update.agent, status: update.status, time: new Date()});
-      if (timeline.length > 100) timeline.pop();
-    }
-    prevStatuses[update.pane_id] = update.status;
-    render();
-  }
-  else if (msg.type === 'blocked') {
-    const a = agents.find(x => x.pane_id === msg.pane_id);
-    if (a) {
-      a.status='blocked';
-      a.prompt=msg.prompt;
-      a.prompt_id=msg.prompt_id;
-      a.options=msg.options;
-      a.selected_options=msg.selected_options||[];
-      a.multi_options=msg.multi_options||[];
-      a.interaction=msg.interaction;
-      a.multi=msg.multi;
-    }
-    else agents.push({...msg, status:'blocked'});
-    if(window.cue) cue('chime');
-    if (!msg.update) {
-      timeline.unshift({project: msg.project, agent: msg.agent, status: 'blocked', time: new Date()});
-      if (timeline.length > 100) timeline.pop();
-    }
-    render();
-    if (msg.pane_id===activePane) openTerminal(activePane);
-  } else if (msg.type === 'pane_content' && msg.pane_id === activePane) {
-    const el = document.getElementById('termContent');
-    const prevHeight = el.scrollHeight;
-    const prevScroll = el.scrollTop;
-    el.replaceChildren(ansiFragment(msg.content || '(empty)'));
-    if (userScrolledUp) {
-      // Keep scroll position relative to bottom (content may have grown at top)
-      const growth = el.scrollHeight - prevHeight;
-      el.scrollTop = prevScroll + growth;
-    } else {
-      el.scrollTop = el.scrollHeight;
-    }
-  } else if (msg.type === 'history' && msg.pane_id === activePane) {
-    renderHistory(msg.messages || []);
-  }
-}
-
-function render() {
-  document.getElementById('agentCount').textContent = agents.length ? `${agents.length}` : '';
-  const workspaces = [...new Set(agents.map(a => a.workspace_id).filter(Boolean))];
-  if (workspaces.length <= 1) {
-    activeWorkspace = null;
-    activeTab = null;
-    renderAgentList(agents);
-    return;
-  }
-  renderWorkspaces(workspaces);
-}
-
-function renderWorkspaces(workspaces) {
-  let html = '';
-  // Hoist blocked agents
-  const blocked = agents.filter(a => a.status === 'blocked');
-  if (blocked.length) {
-    html += `<div class="section-header" style="color:var(--red)"><span class="dot" style="background:var(--red)"></span>Needs you <span style="opacity:0.6">(${blocked.length})</span></div>`;
-    html += blocked.map(a => agentCard(a)).join('');
-  }
-  // Space chip strip
-  html += `<div class="chip-strip"><span class="chip-label">Spaces</span>`;
-  html += `<button class="chip${activeWorkspace===null?' active':''}" onclick="backToWorkspaces()">All</button>`;
-  for (const wsId of workspaces) {
-    const wsAgents = agents.filter(a => a.workspace_id === wsId);
-    const hasBlocked = wsAgents.some(a => a.status === 'blocked');
-    const name = wsAgents[0]?.workspace_label || wsAgents[0]?.project || wsId.slice(0, 8);
-    html += `<button class="chip${activeWorkspace===wsId?' active':''}${hasBlocked?' alert':''}" onclick="selectWorkspace('${wsId}')">${name}</button>`;
-  }
-  html += `</div>`;
-  // Tab chip strip (always show when workspace selected)
-  if (activeWorkspace) {
-    const wsTabs = [...new Set(agents.filter(a => a.workspace_id === activeWorkspace).map(a => a.tab_id).filter(Boolean))];
-    html += `<div class="chip-strip"><span class="chip-label">Tabs</span>`;
-    if (wsTabs.length > 1) {
-      html += `<button class="chip${!activeTab?' active':''}" onclick="selectTab(null)">All</button>`;
-    }
-    wsTabs.forEach((tid, i) => {
-      const tabAgents = agents.filter(a => a.tab_id === tid);
-      const hasBlocked = tabAgents.some(a => a.status === 'blocked');
-      const tabLabel = tabAgents[0]?.label || 'Tab '+(i+1);
-      html += `<button class="chip${activeTab===tid?' active':''}${hasBlocked?' alert':''}" id="tab-${tid}" onclick="selectTab('${tid}')" data-tab-id="${tid}" data-tab-name="${tabLabel}">${tabLabel}</button>`;
-    });
-    html += `<button class="chip chip-add" onclick="createTab('${activeWorkspace}')">+</button>`;
-    html += `</div>`;
-  }
-  // Agent list (filtered)
-  let filtered = agents;
-  if (activeWorkspace) filtered = filtered.filter(a => a.workspace_id === activeWorkspace);
-  if (activeTab) filtered = filtered.filter(a => a.tab_id === activeTab);
-  // Don't re-show blocked that are already hoisted
-  const working = filtered.filter(a => a.status==='working');
-  const done = filtered.filter(a => a.status==='done');
-  const idle = filtered.filter(a => a.status==='idle'||a.status==='unknown');
-  if (working.length) html += section('Working', 'var(--green)', working);
-  if (done.length) html += section('Done', 'var(--muted)', done);
-  if (idle.length) html += section('Idle', 'var(--muted)', idle);
-  if (!agents.length) html = '<div class="empty">Waiting for agents…</div>';
-  document.getElementById('agents').innerHTML = html;
-}
-
-function renderAgentList(list) {
-  const blocked = list.filter(a => a.status==='blocked');
-  const working = list.filter(a => a.status==='working');
-  const done = list.filter(a => a.status==='done');
-  const idle = list.filter(a => a.status==='idle'||a.status==='unknown');
-  let html = '';
-  if (blocked.length) html += section('Blocked', 'var(--red)', blocked);
-  if (working.length) html += section('Working', 'var(--green)', working);
-  if (done.length) html += section('Done', 'var(--muted)', done);
-  if (idle.length) html += section('Idle', 'var(--muted)', idle);
-  if (!list.length) html = emptyStateHtml();
-  document.getElementById('agents').innerHTML = html;
-  bindLongPressHandlers();
-}
-
-function emptyStateHtml() {
-  if (switchingSession) return '<div class="empty">switching…</div>';
-  // Only meaningful with exactly one source: with remotes configured,
-  // "local" being idle says nothing about why the list is empty overall.
-  const sources = sessionState?.sources || [];
-  if (sources.length === 1) {
-    const local = sources[0];
-    const active = local.active || 'default';
-    const entry = local.sessions.find(s => s.name === active);
-    // Same wording herdr-remote-session prints, so CLI and UI agree.
-    if (entry && !entry.running) {
-      return `<div class="empty">session '${active}' is not running</div>`;
-    }
-  }
-  return '<div class="empty">Waiting for agents…</div>';
-}
-
-function bindLongPressHandlers() {
-  // Bind to tabs
-  document.querySelectorAll('[data-tab-id]').forEach(el => {
-    const id = el.dataset.tabId;
-    const name = el.dataset.tabName;
-    setupLongPress(el, 'tab', id, name);
-  });
-  // Bind to agents
-  document.querySelectorAll('[data-pane-id]').forEach(el => {
-    const id = el.dataset.paneId;
-    const name = el.dataset.agentName;
-    setupLongPress(el, 'agent', id, name);
-  });
-}
-
-function selectWorkspace(id) { activeWorkspace = id; activeTab = null; render(); }
-
-let sessionState = null;
-
-function renderSessionSelector() {
-  const btn = document.getElementById('sessionSelector');
-  const menu = document.getElementById('sessionMenu');
-  const picker = document.getElementById('sessionPicker');
-  const sources = sessionState?.sources || [];
-  const total = sources.reduce((n, s) => n + s.sessions.length, 0);
-  // Nothing to switch between: stay out of the way. Hide the wrapper, not just
-  // the button, or the header's flex gap leaves a stray space behind.
-  if (total < 2) { picker.style.display = 'none'; menu.style.display = 'none'; return; }
-  picker.style.display = '';
-
-  const multiSource = sources.length > 1;
-  if (multiSource) {
-    // The trigger used to show local's session unconditionally, so with
-    // remotes configured switching a remote looked like it did nothing.
-    // Stay neutral instead of naming one specific source's session.
-    btn.textContent = 'sessions ▾';
-  } else {
-    const local = sources[0];
-    const active = local.active || 'default';
-    const entry = local.sessions.find(s => s.name === active);
-    // Fall back to the raw active value when nothing matches, so a
-    // mismatch (e.g. herdr's default session not literally named
-    // "default") degrades to a correct-but-unticked label rather than a
-    // confidently wrong one.
-    btn.textContent = (entry ? entry.name : local.active) + ' ▾';
-  }
-
-  const rowTargets = [];
-  menu.innerHTML = sources.map(src => {
-    const header = multiSource
-      ? `<div class="chip-label" style="padding:4px 8px">${escapeHtml(src.host)}</div>`
-      : '';
-    const rows = src.sessions.map(s => {
-      const active = (src.active || 'default') === s.name;
-      const dim = s.running ? '' : 'opacity:0.55;';
-      rowTargets.push({ host: src.host, session: s.name });
-      // The tick lives in a fixed-width span so ticked and unticked names
-      // start at the same x. A bare space would collapse in HTML.
-      return `<div role="option" aria-selected="${active}" tabindex="0" style="${dim}"`
-           + `><span class="session-mark">${active ? '✓' : ''}</span>`
-           + `${escapeHtml(s.name)}${s.running ? '' : ' ·'}</div>`;
-    }).join('');
-    return header + rows;
-  }).join('');
-
-  // Host/session go on via the dataset property setter, not string
-  // interpolation, so a name or host containing quotes or markup can't
-  // break out of an attribute or inject JS. Wired after innerHTML is set,
-  // since the rows above carry no onclick/onkeydown of their own.
-  menu.querySelectorAll('[role="option"]').forEach((row, i) => {
-    row.dataset.host = rowTargets[i].host;
-    row.dataset.session = rowTargets[i].session;
-    const activate = () => switchHerdrSession(row.dataset.host, row.dataset.session);
-    row.addEventListener('click', activate);
-    row.addEventListener('keydown', (event) => {
-      if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); activate(); }
-    });
-  });
-}
-
-function toggleSessionMenu() {
-  const menu = document.getElementById('sessionMenu');
-  // Read the computed style, not the inline one: the menu starts hidden via
-  // the stylesheet, so menu.style.display is '' on the first click and an
-  // inline-only check would silently "close" an already-closed menu.
-  const show = getComputedStyle(menu).display === 'none';
-  menu.style.display = show ? 'block' : 'none';
-  document.getElementById('sessionSelector').setAttribute('aria-expanded', String(show));
-}
-
-let switchingSession = false;
-
-function switchHerdrSession(host, session) {
-  if (!ws || ws.readyState !== WebSocket.OPEN) return;
-  document.getElementById('sessionMenu').style.display = 'none';
-  document.getElementById('sessionSelector').setAttribute('aria-expanded', 'false');
-  // A switch clears relay state and re-polls; a bare empty list would read as
-  // breakage. Routed through the existing render path, not by poking the DOM —
-  // there is no #agentList element. Mutate local state only after we know
-  // the send will happen, so a dead socket can't leave the UI stuck showing
-  // "switching…" forever.
-  switchingSession = true;
-  agents = [];
-  render();
-  ws.send(JSON.stringify({ type: 'session_switch', host, session }));
-}
-
-function backToWorkspaces() { activeWorkspace = null; activeTab = null; render(); }
-function selectTab(id) { activeTab = id; render(); }
-
-function createTab(workspaceId) {
-  if (!ws) return;
-  if (window.cue) cue('sparkle');
-  ws.send(JSON.stringify({type:'create_tab', workspace_id: workspaceId}));
-  setTimeout(() => { activeTab = null; }, 1500);
-}
-
-function agentCard(a) {
-  const color = a.status==='blocked'?'var(--red)':a.status==='working'?'var(--green)':'var(--muted)';
-  const pulseClass = a.status==='working'?' pulse':'';
-  const host = a.host&&a.host!=='local'?` <span style="color:var(--orange);font-size:0.6rem">@${a.host}</span>`:'';
-  const cwd = a.cwd ? `<span style="font-family:monospace;opacity:0.7">${a.cwd.split('/').slice(-2).join('/')}</span>` : '';
-  const label = a.label||a.workspace_label||a.project||a.agent;
-  return `<div class="agent${a.status==='blocked'?' blocked':''}" role="button" tabindex="0" aria-label="${label}, ${a.status}" data-pane-id="${a.pane_id}" data-agent-name="${label}" onclick="openTerminal('${a.pane_id}')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();openTerminal('${a.pane_id}')}">
-    <span class="dot${pulseClass}" style="background:${color}" aria-hidden="true"></span>
-    <div class="info"><div class="project">${label}${host}</div><div class="meta">${a.agent} · ${cwd}</div></div>
-    <span style="color:var(--muted);font-size:1.2rem" aria-hidden="true">›</span>
-  </div>`;
-}
-
-function section(title, color, list) {
-  return `<div class="section-header"><span class="dot" style="background:${color}"></span>${title}</div>` +
-    list.map(a => agentCard(a)).join('');
-}
-
-function openTerminal(paneId) {
-  activePane = paneId; paneLines = 200; userScrolledUp = false;
-  const a = agents.find(x => x.pane_id===paneId);
-  document.getElementById('termTitle').textContent = a?`${a.label||a.workspace_label||a.project} · ${a.agent}`:paneId;
-  document.getElementById('agentListView').style.display = 'none';
-  if (refreshInterval) clearInterval(refreshInterval);
-  document.getElementById('terminalView').classList.add('active');
-  const qa = document.getElementById('quickActions');
-  const ak = document.getElementById('actionKeys');
-  qa.replaceChildren();
-  ak.replaceChildren();
-  if (a&&a.status==='blocked') {
-    const opts = a.interaction==='omp_question'&&a.multi
-      ? (Array.isArray(a.multi_options)?a.multi_options:[])
-      : (Array.isArray(a.options)?a.options:[]);
-    for (const option of opts) {
-      const button = document.createElement('button');
-      const lower = option.toLowerCase();
-      button.className = lower.includes('yes')||lower.includes('approve')?'btn-yes':lower.includes('trust')?'btn-trust':'btn-no';
-      button.textContent = option.split(',')[0];
-      if (a.interaction==='omp_question'&&a.multi) {
-        button.dataset.selected=String((a.selected_options||[]).includes(option));
-        button.classList.toggle('selected',button.dataset.selected==='true');
-        button.addEventListener('click',()=>{
-          const selected=button.dataset.selected!=='true';
-          button.dataset.selected=String(selected);
-          button.classList.toggle('selected',selected);
-          ws.send(JSON.stringify({type:'question_toggle',pane_id:activePane,prompt_id:a.prompt_id,option}));
-        });
-      } else {
-        button.addEventListener('click',()=>respond(option));
-      }
-      qa.appendChild(button);
-    }
-    if (a.interaction==='omp_question'&&a.multi) {
-      const submit=document.createElement('button');
-      submit.className='btn-yes';
-      submit.textContent='Submit';
-      submit.addEventListener('click',()=>ws.send(JSON.stringify({type:'question_submit',pane_id:activePane,prompt_id:a.prompt_id})));
-      qa.appendChild(submit);
-    } else if (a.interaction!=='omp_question'&&opts.includes('yes, single permission')) {
-      for (const [label,cls,response] of [
-        ['y','key-green','yes, single permission'],
-        ['a','key-blue','trust, always allow'],
-        ['n','key-red','no (tab to edit)'],
-      ]) {
-        const button = document.createElement('button');
-        button.className = cls;
-        button.textContent = label;
-        button.addEventListener('click',()=>respond(response));
-        ak.appendChild(button);
-      }
-    }
-  }
-  refreshPane();
-  refreshInterval = setInterval(refreshPane, 3000);
-}
-
-function closeTerminal() {
-  activePane = null; clearInterval(refreshInterval);
-  document.getElementById('terminalView').classList.remove('active');
-  document.getElementById('agentListView').style.display = '';
-}
-
-let paneLines = 200;
-function refreshPane() { if(ws&&ws.readyState===WebSocket.OPEN&&activePane) ws.send(JSON.stringify({type:'read_pane',pane_id:activePane,lines:paneLines,format:'ansi'})); }
-function loadMore() { paneLines = Math.min(paneLines + 500, 5000); refreshPane(); }
-
-// Find in output
-let searchMatches = [];
-let searchIndex = 0;
-let originalContent = '';
-
-function toggleSearch() {
-  const bar = document.getElementById('termSearch');
-  const input = document.getElementById('searchInput');
-  if (bar.style.display === 'none') {
-    bar.style.display = 'flex';
-    document.getElementById('termHistory').style.display = 'none'; // close history if open
-    input.focus();
-  } else {
-    bar.style.display = 'none';
-    input.value = '';
-    clearSearch();
-  }
-}
-
-function toggleHistory() {
-  const panel = document.getElementById('termHistory');
-  if (panel.style.display === 'none') {
-    panel.style.display = 'flex';
-    document.getElementById('termSearch').style.display = 'none'; // close search if open
-    loadHistory();
-  } else {
-    panel.style.display = 'none';
-  }
-}
-
-function loadHistory() {
-  if (!ws || !activePane) return;
-  document.getElementById('historyContent').innerHTML = '<div style="color:var(--muted)">Loading...</div>';
-  ws.send(JSON.stringify({ type: 'get_history', pane_id: activePane }));
-}
-
-function renderHistory(messages) {
-  const el = document.getElementById('historyContent');
-  if (!messages || !messages.length) {
-    el.innerHTML = '<div style="color:var(--muted)">No conversation history available.<br><br>History is read from the agent\'s session log when supported.</div>';
-    return;
-  }
-  el.innerHTML = messages.map(m => `
-    <div class="msg">
-      <div class="msg-role ${m.role === 'user' ? 'msg-user' : 'msg-assistant'}">${m.role}</div>
-      <div class="msg-text">${escapeHtml(m.content || '').slice(0, 2000)}${(m.content?.length || 0) > 2000 ? '...' : ''}</div>
-    </div>
-  `).join('');
-}
-
-function escapeHtml(text) {
-  const div = document.createElement('div');
-  div.textContent = text;
-  return div.innerHTML;
-}
-
-function doSearch() {
-  const query = document.getElementById('searchInput').value.toLowerCase();
-  const el = document.getElementById('termContent');
-  const countEl = document.getElementById('searchCount');
-  
-  // Restore original content first
-  if (!originalContent) originalContent = el.innerHTML;
-  el.innerHTML = originalContent;
-  
-  if (!query || query.length < 2) {
-    countEl.textContent = '';
-    searchMatches = [];
-    return;
-  }
-  
-  // Find and highlight matches
-  const text = el.textContent;
-  const regex = new RegExp(query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi');
-  let match;
-  searchMatches = [];
-  
-  while ((match = regex.exec(text)) !== null) {
-    searchMatches.push(match.index);
-  }
-  
-  if (searchMatches.length === 0) {
-    countEl.textContent = '0/0';
-    return;
-  }
-  
-  // Highlight all matches in HTML
-  let html = originalContent;
-  const tempDiv = document.createElement('div');
-  tempDiv.innerHTML = html;
-  const walker = document.createTreeWalker(tempDiv, NodeFilter.SHOW_TEXT);
-  const textNodes = [];
-  while (walker.nextNode()) textNodes.push(walker.currentNode);
-  
-  let matchIdx = 0;
-  textNodes.forEach(node => {
-    const nodeText = node.textContent;
-    const parts = nodeText.split(regex);
-    if (parts.length > 1) {
-      const frag = document.createDocumentFragment();
-      const matches = nodeText.match(regex) || [];
-      parts.forEach((part, i) => {
-        frag.appendChild(document.createTextNode(part));
-        if (matches[i]) {
-          const mark = document.createElement('mark');
-          mark.className = matchIdx === searchIndex ? 'search-current' : 'search-highlight';
-          mark.textContent = matches[i];
-          mark.dataset.matchIndex = matchIdx++;
-          frag.appendChild(mark);
-        }
-      });
-      node.parentNode.replaceChild(frag, node);
-    }
-  });
-  
-  el.innerHTML = tempDiv.innerHTML;
-  searchIndex = 0;
-  countEl.textContent = `1/${searchMatches.length}`;
-  scrollToMatch();
-}
-
-function searchNav(dir) {
-  if (!searchMatches.length) return;
-  searchIndex = (searchIndex + dir + searchMatches.length) % searchMatches.length;
-  document.getElementById('searchCount').textContent = `${searchIndex + 1}/${searchMatches.length}`;
-  
-  // Update highlight classes
-  document.querySelectorAll('.search-highlight, .search-current').forEach((el, i) => {
-    el.className = i === searchIndex ? 'search-current' : 'search-highlight';
-  });
-  scrollToMatch();
-}
-
-function scrollToMatch() {
-  const current = document.querySelector('.search-current');
-  if (current) current.scrollIntoView({ behavior: 'smooth', block: 'center' });
-}
-
-function clearSearch() {
-  const el = document.getElementById('termContent');
-  if (originalContent) {
-    el.innerHTML = originalContent;
-    originalContent = '';
-  }
-  searchMatches = [];
-  searchIndex = 0;
-  document.getElementById('searchCount').textContent = '';
-}
-
-// Long-press context menu
-let longPressTimer = null;
-let contextTarget = null;
-
-function showContextMenu(e, type, id, name) {
-  e.preventDefault();
-  const menu = document.getElementById('contextMenu');
-  const items = document.getElementById('contextMenuItems');
-  contextTarget = { type, id, name };
-  
-  let html = '';
-  if (type === 'tab') {
-    html = `
-      <div class="ctx-item" onclick="renameItem()">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/></svg>
-        Rename Tab
-      </div>
-      <div class="ctx-item danger" onclick="closeItem()">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6 6 18M6 6l12 12"/></svg>
-        Close Tab
-      </div>
-    `;
-  } else if (type === 'agent') {
-    html = `
-      <div class="ctx-item" onclick="renameItem()">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/></svg>
-        Rename Agent
-      </div>
-      <div class="ctx-item" onclick="interruptAgent()">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>
-        Interrupt (Esc)
-      </div>
-    `;
-  }
-  items.innerHTML = html;
-  
-  // Position menu
-  const x = Math.min(e.clientX || e.touches?.[0]?.clientX || 100, window.innerWidth - 180);
-  const y = Math.min(e.clientY || e.touches?.[0]?.clientY || 100, window.innerHeight - 120);
-  menu.style.left = x + 'px';
-  menu.style.top = y + 'px';
-  menu.style.display = 'block';
-  
-  if (window.cue) cue('tick');
-}
-
-function hideContextMenu() {
-  document.getElementById('contextMenu').style.display = 'none';
-  contextTarget = null;
-}
-
-function renameItem() {
-  if (!contextTarget) return;
-  const newName = prompt(`Rename ${contextTarget.type}:`, contextTarget.name || '');
-  if (newName && ws) {
-    if (contextTarget.type === 'tab') {
-      ws.send(JSON.stringify({ type: 'rename_tab', tab_id: contextTarget.id, label: newName }));
-    } else if (contextTarget.type === 'agent') {
-      ws.send(JSON.stringify({ type: 'send_text', pane_id: contextTarget.id, text: `/rename ${newName}` }));
-    }
-    if (window.cue) cue('success');
-  }
-  hideContextMenu();
-}
-
-function closeItem() {
-  if (!contextTarget || contextTarget.type !== 'tab') return;
-  if (confirm(`Close tab "${contextTarget.name || contextTarget.id}"?`)) {
-    if (ws) ws.send(JSON.stringify({ type: 'close_tab', tab_id: contextTarget.id }));
-    if (window.cue) cue('droplet');
-  }
-  hideContextMenu();
-}
-
-function interruptAgent() {
-  if (!contextTarget || contextTarget.type !== 'agent') return;
-  if (ws) ws.send(JSON.stringify({ type: 'send_keys', pane_id: contextTarget.id, keys: ['Escape'] }));
-  if (window.cue) cue('toggle');
-  hideContextMenu();
-}
-
-// Close context menu on click outside
-document.addEventListener('click', (e) => {
-  if (!e.target.closest('#contextMenu')) hideContextMenu();
-});
-
-// Long press handler for touch
-function setupLongPress(el, type, id, name) {
-  el.addEventListener('touchstart', (e) => {
-    longPressTimer = setTimeout(() => showContextMenu(e, type, id, name), 500);
-  }, { passive: true });
-  el.addEventListener('touchend', () => clearTimeout(longPressTimer));
-  el.addEventListener('touchmove', () => clearTimeout(longPressTimer));
-  // Right-click for desktop
-  el.addEventListener('contextmenu', (e) => showContextMenu(e, type, id, name));
-}
-
-// Text sent through respond, kept until the relay accepts or rejects it so a
-// rejection can be retried on the channel that can carry it. See handleMessage.
-let pendingFreeText = null;
-
-function sendText() {
-  const i=document.getElementById('termInput');
-  if(!i.value||!ws||!activePane)return;
-  const agent=agents.find(a=>a.pane_id===activePane);
-  if(agent&&agent.status==='blocked') {
-    pendingFreeText={pane_id:activePane,text:i.value};
-    ws.send(JSON.stringify({type:'respond',pane_id:activePane,prompt_id:agent.prompt_id,text:i.value}));
-  } else {
-    ws.send(JSON.stringify({type:'send_text',pane_id:activePane,text:i.value}));
-    ws.send(JSON.stringify({type:'send_keys',pane_id:activePane,keys:['Enter']}));
-  }
-  i.value=''; setTimeout(refreshPane,500);
-}
-function sendKey(k){if(!ws||!activePane)return;ws.send(JSON.stringify({type:'send_keys',pane_id:activePane,keys:[k]}));setTimeout(refreshPane,300);}
-function sendKeys(k){if(!ws||!activePane)return;ws.send(JSON.stringify({type:'send_keys',pane_id:activePane,keys:k}));setTimeout(refreshPane,300);}
-
-// --- Nav Tray (collie-style) ---
-let keyQueue = [], armedMod = null, ctrlConfirm = null;
-const CTRL_PRESETS = [
-  {label:'Ctrl C', keys:['ctrl+c']},
-  {label:'Ctrl D', keys:['ctrl+d'], danger:true},
-  {label:'Ctrl U', keys:['ctrl+u']},
-  {label:'Ctrl R', keys:['ctrl+r']},
-  {label:'Ctrl L', keys:['ctrl+l']},
-  {label:'Ctrl Z', keys:['ctrl+z'], danger:true},
-];
-const DANGER_KEYS = new Set(['ctrl+c','ctrl+d','ctrl+z']);
-
-function fireKey(k) {
-  if(window.cue) cue('tick');
-  const composed = armedMod ? `${armedMod}+${k}` : k;
-  if (keyQueue.length > 0 || armedMod) {
-    keyQueue.push(composed);
-    armedMod = null;
-    if(window.cue) cue('droplet');
-    renderKeyQueue();
-    renderMods();
-  } else {
-    sendKeys([composed]);
-  }
-}
-
-function armMod(m) {
-  armedMod = armedMod === m ? null : m;
-  if(window.cue) cue('toggle');
-  renderMods();
-}
-
-function renderMods() {
-  const s = document.getElementById('modShift');
-  const c = document.getElementById('modCtrl');
-  if (s) s.classList.toggle('armed', armedMod === 'shift');
-  if (c) c.classList.toggle('armed', armedMod === 'ctrl');
-}
-
-function renderKeyQueue() {
-  const strip = document.getElementById('keyQueueStrip');
-  if (!keyQueue.length && !armedMod) { strip.style.display = 'none'; return; }
-  strip.style.display = 'flex';
-  let html = keyQueue.map((k,i) => {
-    const isDanger = DANGER_KEYS.has(k.toLowerCase());
-    const label = k.includes('+') ? k.replace('ctrl+','Ctrl ').replace('shift+','\u21e7 ') : k;
-    return `<span class="queue-chip${isDanger?' danger':''}" onclick="removeQueueKey(${i})">${label} \u00d7</span>`;
-  }).join('');
-  if (armedMod) html += `<span style="color:var(--muted);font-size:12px;padding:4px">${armedMod==='shift'?'\u21e7':'Ctrl'} + \u2026</span>`;
-  html += `<span style="margin-left:auto;display:flex;gap:4px">`;
-  html += `<button onclick="sendQueuedKeys()" style="padding:6px 12px;border-radius:6px;border:none;background:${keyQueue.some(k=>DANGER_KEYS.has(k.toLowerCase()))?'var(--red)':'var(--blue)'};color:#fff;font-size:12px;font-weight:600;cursor:pointer">Send</button>`;
-  html += `<button onclick="clearKeyQueue()" style="padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:var(--muted);font-size:12px;cursor:pointer">✕</button>`;
-  html += `</span>`;
-  strip.innerHTML = html;
-}
-
-function removeQueueKey(i) { keyQueue.splice(i,1); renderKeyQueue(); }
-function clearKeyQueue() { keyQueue=[]; armedMod=null; renderKeyQueue(); renderMods(); }
-function sendQueuedKeys() {
-  if (!keyQueue.length) return;
-  if(window.cue) cue('success');
-  sendKeys(keyQueue);
-  keyQueue=[]; armedMod=null; renderKeyQueue(); renderMods();
-}
-
-function toggleKeysDock() {
-  const el = document.getElementById('termKeys');
-  const quick = document.getElementById('quickDock');
-  const show = el.style.display === 'none';
-  el.style.display = show ? '' : 'none';
-  if (show) quick.style.display = 'none'; // mutual exclusive
-  if(window.cue) cue(show ? 'page' : 'tick');
-}
-
-function toggleQuickDock() {
-  const el = document.getElementById('quickDock');
-  const keys = document.getElementById('termKeys');
-  const show = el.style.display === 'none';
-  el.style.display = show ? '' : 'none';
-  if (show) keys.style.display = 'none'; // mutual exclusive
-  if(window.cue) cue(show ? 'page' : 'tick');
-}
-
-function quickSend(text) {
-  if (!ws || !activePane) return;
-  if(window.cue) cue('success');
-  ws.send(JSON.stringify({type:'send_text', pane_id: activePane, text: text}));
-  ws.send(JSON.stringify({type:'send_keys', pane_id: activePane, keys:['Enter']}));
-  document.getElementById('quickDock').style.display = 'none';
-  setTimeout(refreshPane, 500);
-}
-
-function switchKeyTab(tab) {
-  document.getElementById('tabKeys').classList.toggle('active', tab==='keys');
-  document.getElementById('tabDigits').classList.toggle('active', tab==='digits');
-  document.getElementById('keysPad').style.display = tab==='keys' ? '' : 'none';
-  const dp = document.getElementById('digitsPad');
-  dp.style.display = tab==='digits' ? 'grid' : 'none';
-  if (tab==='digits' && !dp.innerHTML) {
-    dp.innerHTML = [1,2,3,4,5,6,7,8,9].map(d => `<button class="digit-key" onclick="fireKey('${d}')">${d}</button>`).join('');
-  }
-}
-
-function toggleCtrlPresets() {
-  const el = document.getElementById('ctrlPresets');
-  const chevron = document.getElementById('ctrlChevron');
-  const show = el.style.display === 'none';
-  el.style.display = show ? 'grid' : 'none';
-  chevron.textContent = show ? '\u25be' : '\u25b8';
-  if (show && !el.innerHTML) {
-    el.innerHTML = CTRL_PRESETS.map(p => {
-      const cls = p.danger ? 'ctrl-key danger' : 'ctrl-key';
-      return `<button class="${cls}" onclick="pressCtrl('${p.label}')">${p.label}</button>`;
-    }).join('');
-  }
-}
-
-function pressCtrl(label) {
-  const preset = CTRL_PRESETS.find(p => p.label === label);
-  if (!preset) return;
-  // If composing (queue has items), just stage it
-  if (keyQueue.length > 0) { keyQueue.push(...preset.keys); renderKeyQueue(); return; }
-  // Two-tap confirm for danger keys
-  if (preset.danger && ctrlConfirm !== label) {
-    ctrlConfirm = label;
-    if(window.cue) cue('error');
-    const el = document.getElementById('ctrlPresets');
-    el.innerHTML = CTRL_PRESETS.map(p => {
-      const cls = p.danger ? (p.label===label?'ctrl-key confirm':'ctrl-key danger') : 'ctrl-key';
-      const txt = p.label===label ? 'Confirm?' : p.label;
-      return `<button class="${cls}" onclick="pressCtrl('${p.label}')">${txt}</button>`;
-    }).join('');
-    setTimeout(() => { ctrlConfirm=null; toggleCtrlPresets(); toggleCtrlPresets(); }, 3000);
-    return;
-  }
-  ctrlConfirm = null;
-  sendKeys(preset.keys);
-}
-
-function toggleArrows(){}
-function hideArrows(){}
-function respond(t){
-  if(!ws||!activePane)return;
-  if(window.cue)cue('success');
-  pendingFreeText=null;   // an option button is not the typed text
-  // The relay drops a respond whose prompt_id does not match what the pane is
-  // showing, so send the one that arrived with the blocked message -- same as
-  // sendText() below and as the Telegram and TUI clients.
-  const agent=agents.find(a=>a.pane_id===activePane);
-  ws.send(JSON.stringify({type:'respond',pane_id:activePane,prompt_id:agent?.prompt_id,text:t}));
-  document.getElementById('quickActions').innerHTML='';
-  setTimeout(refreshPane,500);
-}
-document.getElementById('termInput').addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();sendText();}});
-document.getElementById('termContent').addEventListener('scroll', function() {
-  const el = this;
-  userScrolledUp = (el.scrollHeight - el.scrollTop - el.clientHeight) > 50;
-  if (el.scrollTop === 0 && paneLines < 5000) loadMore();
-});
-
-if (savedUrl) setTimeout(connect, 100); else showSetup();
-
-// --- Command Palette ---
-const COMMANDS = {
-  claude: [
-    {cmd: '/compact', desc: 'Summarize context to free tokens', common: true},
-    {cmd: '/clear', desc: 'Start fresh conversation', common: true, danger: true},
-    {cmd: '/model', desc: 'Switch model', common: true},
-    {cmd: '/status', desc: 'Show version and connectivity', common: true},
-    {cmd: '/context', desc: 'Visualize context-window usage', common: true},
-    {cmd: '/review', desc: 'Review a pull request', common: true},
-    {cmd: '/diff', desc: 'Show uncommitted changes', common: false},
-    {cmd: '/resume', desc: 'Resume previous conversation', common: false},
-    {cmd: '/help', desc: 'Show all commands', common: false},
-  ],
-  codex: [
-    {cmd: '/compact', desc: 'Summarize history to free context', common: true},
-    {cmd: '/clear', desc: 'Reset and start new chat', common: true, danger: true},
-    {cmd: '/diff', desc: 'Show git diff of working tree', common: true},
-    {cmd: '/model', desc: 'Switch model', common: true},
-    {cmd: '/status', desc: 'Show model and token usage', common: true},
-    {cmd: '/review', desc: 'Code review working tree', common: true},
-    {cmd: '/mention', desc: 'Attach files to context', common: false},
-    {cmd: '/plan', desc: 'Enter plan mode', common: false},
-  ],
-  pi: [
-    {cmd: '/compact', desc: 'Compact context', common: true},
-    {cmd: '/new', desc: 'Start new session', common: true, danger: true},
-    {cmd: '/model', desc: 'Switch model', common: true},
-    {cmd: '/session', desc: 'Show session info', common: true},
-    {cmd: '/tree', desc: 'Jump to earlier point', common: true},
-    {cmd: '/share', desc: 'Share session as gist', common: true},
-    {cmd: '/copy', desc: 'Copy last response', common: false},
-    {cmd: '/reload', desc: 'Reload extensions and skills', common: false},
-  ],
-  opencode: [
-    {cmd: '/compact', desc: 'Compact current session', common: true},
-    {cmd: '/new', desc: 'Start new session', common: true, danger: true},
-    {cmd: '/models', desc: 'List and switch models', common: true},
-    {cmd: '/undo', desc: 'Undo last turn and revert', common: true, danger: true},
-    {cmd: '/share', desc: 'Share session', common: true},
-    {cmd: '/diff', desc: 'Show working changes', common: false},
-    {cmd: '/export', desc: 'Export to Markdown', common: false},
-  ],
-};
-
-function getAgentCommands() {
-  const a = agents.find(x => x.pane_id === activePane);
-  if (!a) return [];
-  const key = (a.agent || '').toLowerCase();
-  if (COMMANDS[key]) return COMMANDS[key];
-  if (key.startsWith('claude')) return COMMANDS.claude;
-  if (key.startsWith('codex')) return COMMANDS.codex;
-  if (key.startsWith('pi') || key === 'kiro') return COMMANDS.pi;
-  if (key.startsWith('opencode')) return COMMANDS.opencode;
-  return COMMANDS.claude; // fallback
-}
-
-function openCommandPalette() {
-  if(window.cue) cue('page');
-  document.getElementById('cmdPalette').style.display = '';
-  document.getElementById('cmdSearch').value = '';
-  filterCommands();
-  document.getElementById('cmdSearch').focus();
-}
-function closePalette() { document.getElementById('cmdPalette').style.display = 'none'; }
-
-function filterCommands() {
-  const q = (document.getElementById('cmdSearch').value || '').toLowerCase();
-  const cmds = getAgentCommands();
-  const filtered = q ? cmds.filter(c => c.cmd.includes(q) || c.desc.toLowerCase().includes(q)) : cmds.filter(c => c.common);
-  const el = document.getElementById('cmdList');
-  if (!filtered.length) { el.innerHTML = '<div style="padding:20px;text-align:center;color:var(--muted);font-size:0.8rem">No commands match</div>'; return; }
-  el.innerHTML = filtered.map(c => `<div role="button" tabindex="0" onclick="runCommand('${c.cmd}')" onkeydown="if(event.key==='Enter')runCommand('${c.cmd}')" style="padding:10px 12px;border-radius:8px;cursor:pointer;display:flex;align-items:center;gap:8px;margin-bottom:2px;transition:background 0.15s" onmouseover="this.style.background='var(--border)'" onmouseout="this.style.background=''">
-    <span style="font-family:monospace;font-weight:600;font-size:0.85rem;${c.danger?'color:var(--red)':'color:var(--blue)'}">${c.cmd}</span>
-    <span style="flex:1;font-size:0.75rem;color:var(--muted)">${c.desc}</span>
-  </div>`).join('');
-}
-
-function runCommand(cmd) {
-  closePalette();
-  if (!ws || !activePane) return;
-  ws.send(JSON.stringify({type:'send_text', pane_id: activePane, text: cmd}));
-  ws.send(JSON.stringify({type:'send_keys', pane_id: activePane, keys:['Enter']}));
-  setTimeout(refreshPane, 500);
-}
-
-// --- Web Push ---
-let pushSubscription = null;
-
-async function initPush() {
-  if (!('serviceWorker' in navigator) || !('PushManager' in window)) {
-    document.getElementById('pushStatus').textContent = 'Push not supported in this browser';
-    document.getElementById('pushToggle').style.display = 'none';
-    return;
-  }
-  try {
-    const reg = await navigator.serviceWorker.register('/sw.js');
-    pushSubscription = await reg.pushManager.getSubscription();
-    updatePushUI();
-  } catch (e) {
-    document.getElementById('pushStatus').textContent = 'Service worker error: ' + e.message;
-  }
-}
-
-function updatePushUI() {
-  const btn = document.getElementById('pushToggle');
-  const status = document.getElementById('pushStatus');
-  if (pushSubscription) {
-    btn.textContent = 'Disable Push';
-    btn.style.background = 'var(--red)';
-    status.innerHTML = '<span style="color:var(--green)">● Enabled</span>';
-  } else {
-    btn.textContent = 'Enable Push';
-    btn.style.background = 'var(--green)';
-    status.innerHTML = '<span style="color:var(--muted)">○ Disabled</span>';
-  }
-}
-
-async function togglePush() {
-  if (pushSubscription) {
-    // Unsubscribe
-    if (ws && ws.readyState === 1) {
-      ws.send(JSON.stringify({type: 'push_unsubscribe', subscription: pushSubscription.toJSON()}));
-    }
-    await pushSubscription.unsubscribe();
-    pushSubscription = null;
-    updatePushUI();
-  } else {
-    // Subscribe
-    try {
-      const relayUrl = localStorage.getItem('herdr_relay_url') || '';
-      const httpUrl = relayUrl.replace('wss://', 'https://').replace('ws://', 'http://');
-      const resp = await fetch(httpUrl + '/api/vapid-public-key');
-      const {publicKey} = await resp.json();
-      if (!publicKey) {
-        document.getElementById('pushStatus').textContent = 'VAPID key not configured on relay';
-        return;
-      }
-      const reg = await navigator.serviceWorker.ready;
-      pushSubscription = await reg.pushManager.subscribe({
-        userVisibleOnly: true,
-        applicationServerKey: urlBase64ToUint8Array(publicKey)
-      });
-      if (ws && ws.readyState === 1) {
-        ws.send(JSON.stringify({type: 'push_subscribe', subscription: pushSubscription.toJSON()}));
-      }
-      updatePushUI();
-    } catch (e) {
-      document.getElementById('pushStatus').textContent = 'Error: ' + e.message;
-    }
-  }
-}
-
-function urlBase64ToUint8Array(base64String) {
-  const padding = '='.repeat((4 - base64String.length % 4) % 4);
-  const base64 = (base64String + padding).replace(/-/g, '+').replace(/_/g, '/');
-  const raw = atob(base64);
-  const arr = new Uint8Array(raw.length);
-  for (let i = 0; i < raw.length; i++) arr[i] = raw.charCodeAt(i);
-  return arr;
-}
-
-initPush();
-</script>
+<script src="js/state.js"></script>
+<script src="js/markdown.js"></script>
+<script src="js/diff.js"></script>
+<script src="js/triage.js"></script>
+<script src="js/spaces.js"></script>
+<script src="js/cards.js"></script>
+<script src="js/mirror.js"></script>
+<script src="js/nav.js"></script>
+<script src="js/palette.js"></script>
+<script src="js/push.js"></script>
 </body>
 </html>

@@ -4,7 +4,7 @@
 # dependencies = ["websockets>=14.0", "zeroconf>=0.80.0", "pywebpush>=2.0.0", "py-vapid>=1.9.0"]
 # ///
 """herdr-remote relay — polls herdr, accepts push events (HTTP POST + WebSocket + UDP), broadcasts to clients."""
-import asyncio, collections, hashlib, json, logging, os, re, shutil, signal, socket, subprocess, threading, time
+import asyncio, hashlib, json, logging, os, re, shlex, shutil, signal, socket, subprocess, threading, time
 
 try:
     from websockets.asyncio.server import serve
@@ -27,6 +27,18 @@ except ModuleNotFoundError:
     _agent_state_module = module_from_spec(_agent_state_spec)
     _agent_state_spec.loader.exec_module(_agent_state_module)
     complete_agent_update_message = _agent_state_module.complete_agent_update_message
+
+try:
+    import transcript
+except ModuleNotFoundError:
+    from importlib.util import module_from_spec, spec_from_file_location
+
+    _transcript_spec = spec_from_file_location(
+        "herdr_remote_transcript",
+        os.path.join(os.path.dirname(__file__), "transcript.py"),
+    )
+    transcript = module_from_spec(_transcript_spec)
+    _transcript_spec.loader.exec_module(transcript)
 
 def _get_log_dir():
     if sys.platform == "darwin":
@@ -61,6 +73,17 @@ HERDR = (
     or ("herdr" if sys.platform == "win32" else "/opt/homebrew/bin/herdr")
 )
 REMOTE_HERDR = os.environ.get("HERDR_REMOTE_BIN", "herdr")
+# Panes with no agent in them. herdr reports 30 panes on this host and only 10 hold an agent, so
+# two thirds of the operator's terminals are invisible to every client. Listing and reading them
+# costs nothing extra -- they come out of the same `pane list` the poll already runs -- but
+# WRITING to one is arbitrary command execution on the host, with no agent-side approval prompt
+# in the way. That is a capability the relay did not have, so it arrives behind a switch rather
+# than with an upgrade. See SECURITY.md.
+SHELL_PANES = os.environ.get("HERDR_SHELL_PANES", "").strip().lower() not in {
+    "", "0", "false", "no", "off",
+}
+# How many neighbour steps focus_shell_pane will take before giving up (see there).
+PANE_WALK_LIMIT = 6
 WS_PORT = int(os.environ.get("HERDR_RELAY_PORT", "8375"))
 RELAY_HOST = os.environ.get("HERDR_RELAY_HOST", "127.0.0.1")
 POLL_INTERVAL = 2
@@ -105,6 +128,24 @@ push_subscriptions = []  # list of PushSubscription dicts
 PUSH_SUBS_FILE = os.path.join(LOG_DIR, "push_subs.json")
 ACTIVE_SESSIONS_FILE = os.path.join(LOG_DIR, "active_sessions.json")
 
+
+ACTIVITY_FILE = os.path.join(LOG_DIR, "activity.json")
+# Entries untouched for this long are dropped on load -- a backstop for panes whose removal we
+# missed (an unclean shutdown). `activity_forget` is the real reaper.
+ACTIVITY_PRUNE_AFTER = 30 * 24 * 60 * 60
+# At most one disk write per this window. An open pane's mirror tick marks it seen every 3s; in
+# memory that is free, on disk it would be a write per tick forever. Losing <=10s of "seen"
+# precision to a crash is imperceptible in a feature whose finest unit is "just now".
+ACTIVITY_FLUSH_DEBOUNCE = 10.0
+# Messages that mean a client is looking at or driving a pane, which is what clears its unread
+# state. One place, so a new handler cannot forget. `focus` is absent on purpose: it moves herdr's
+# own cursor at the desk without the client reading anything, and `seen` is about what YOU looked
+# at through the relay. So are the tab/workspace verbs, which name no pane.
+SEEN_ON = frozenset({
+    "read_pane", "get_history", "respond", "send_keys", "send_text", "agent_prompt",
+    "question_toggle", "question_submit",
+})
+
 if RELAY_HOST not in {"127.0.0.1", "localhost", "::1"} and not AUTH_TOKEN:
     raise SystemExit("HERDR_RELAY_TOKEN is required when HERDR_RELAY_HOST binds beyond loopback")
 
@@ -130,11 +171,47 @@ QUESTION_OTHER = "Other (type your own)"
 
 clients = set()
 last_statuses = {}
+
+# --- Pane activity: what moved, and what you have looked at ---
+#
+# herdr's pane records carry no timestamps at all, so the relay derives and owns both. Two numbers
+# per pane are enough for a client to triage a herd:
+#   active_at -- the last agent status transition this relay observed
+#   seen_at   -- the last time a client opened or drove the pane through this relay
+#
+# "Unseen" is then a COMPARISON, not a stored flag: an agent is newly-finished-and-unread exactly
+# when `status == "done" and active_at > seen_at`. Opening the pane sets seen_at = now and the row
+# leaves that section on its own -- nothing to mark read, nothing to keep in sync.
+#
+# Keyed by (host, pane_id), unlike the maps above: every herdr numbers its own panes, so a bare pane
+# id is not unique across the hosts this relay polls, and this is the one such map written to disk,
+# where a collision would stick.
+pane_activity = {}
+# The status this ledger last saw, kept separately from `last_statuses` above -- that one belongs to
+# the blocked-push logic and is updated on its own schedule, and two features reading one dict would
+# be coupled by call order.
+_activity_status = {}
+_activity_dirty = False
+_activity_flush_task = None
 last_blocked_prompts = {}
 event_queue = asyncio.Queue()
 pane_remote_map = {}
+# pane_id -> the raw agent_session ref herdr reports (kind id|path + value). Kept server-side
+# rather than broadcast: it is the transcript lookup key, and no client needs to know a session
+# uuid to ask for that pane's history.
+pane_session_map = {}
 known_panes = set()
+# pane_id -> the record broadcast for a non-agent pane. Separate from agent_cache because the
+# handlers need to tell the two apart: a shell pane has no question to detect, no approval to
+# match and no `agent focus` to call.
+shell_pane_map = {}
 agent_cache = {}
+# The tab/workspace hierarchy as herdr reports it, refreshed on its own slower cadence (see
+# SPACES_POLL_INTERVAL) and immediately after anything that changes it. `(host, id) -> remote`,
+# because ids are only unique within one herdr: every host numbers its own workspaces w1, w2, ...
+spaces_cache = {"workspaces": [], "tabs": []}
+workspace_remote_map = {}
+tab_remote_map = {}
 _remote_locks = {}
 _remote_locks_guard = threading.Lock()
 _session_list_cache = {}  # source -> (monotonic_timestamp, sessions_list)
@@ -145,9 +222,115 @@ SAFE_RESPONSES = {
     "yes, single permission", "trust, always allow", "no (tab to edit)",
     "approve all pending", "configure individually", "exit (cancel subagents)",
 }
-SAFE_KEYS = {"y", "n", "a", "Enter", "Tab", "Escape", "C-c", "Up", "Down", "Left", "Right", "BSpace"} | {
-    str(number) for number in range(10)
-}
+# Keys the relay will forward, in the grammar herdr actually validates. Live-verified against
+# herdr 0.8.0 (protocol 19) on a throwaway session:
+#   accepted -- bare specials (Enter Escape Tab Space Backspace BS Up Down Left Right F1..F12),
+#               any single character, `+`-joined chords (ctrl+c, shift+tab, alt+Up), and `C-c`,
+#               which is the ONE tmux-style spelling herdr still aliases to interrupt;
+#   rejected -- C-u, M-x, BTab, BSpace, PageUp, PageDown, Home, End, Insert, Delete.
+# `BSpace` used to sit in this set and could never have worked: herdr answers
+# `invalid_key: unsupported key BSpace`. Chords are validated by key_is_allowed(), not enumerated
+# here, because the web app composes them at runtime (ctrl+/shift+ any key) -- this set is the
+# bare-key half of the grammar, and it must stay a self-contained literal expression
+# (tests/test_telegram.py evaluates it straight out of the AST).
+SAFE_KEYS = {
+    "y", "n", "a",
+    "Enter", "Escape", "Tab", "Space", "Backspace", "BS",
+    "Up", "Down", "Left", "Right",
+    "C-c",
+} | {str(number) for number in range(10)} | {f"F{index}" for index in range(1, 13)}
+
+# Modifiers herdr accepts in a chord. `cmd`/`super` are also valid upstream but no client sends
+# them, so they stay out: an allowlist should not be wider than the UI that feeds it.
+SAFE_MODIFIERS = {"ctrl", "shift", "alt"}
+
+# Special key NAMES, lowercased, because herdr matches them case-insensitively -- `shift+tab` and
+# `esc` both ack, so a client spelling them that way is not wrong. Single characters stay
+# case-sensitive (they are typed literally), which is why they aren't in here.
+SAFE_SPECIAL_KEYS = {
+    "enter", "escape", "esc", "tab", "space", "backspace", "bs",
+    "up", "down", "left", "right",
+} | {f"f{index}" for index in range(1, 13)}
+
+
+# Keys herdr's own validator refuses in EVERY spelling -- live re-checked on herdr 0.8.2, which
+# answers `unsupported key PageUp` to PageUp/PgUp/pageup/PgDn/Page_Up alike, and the same for
+# Home and End with or without a modifier. No respelling reaches them through `pane send-keys`.
+#
+# `pane send-text` is a byte channel and passes ESC through verbatim (probed by running `cat -v`
+# in a throwaway pane, which then showed `^[[5~`), so the relay delivers these as the CSI bytes a
+# terminal would emit for the key. A real TUI reads them AS the key: `less` on a 500-line file
+# paged from row 1 to row 70 on ESC[6~ and back to row 1 on ESC[5~.
+#
+# Modified forms are computed rather than enumerated -- xterm encodes the modifier as
+# 1 + shift(1) + alt(2) + ctrl(4), so ctrl+Home is ESC[1;5H and shift+PageUp is ESC[5;2~.
+#
+# Insert and Delete are refused by herdr too and would be one line each here; they stay out until
+# a client asks for them, so this table only covers keys something actually sends.
+CSI_MODIFIER_BITS = {"shift": 1, "alt": 2, "ctrl": 4}
+CSI_TILDE_KEYS = {"pageup": "5", "pagedown": "6"}
+CSI_LETTER_KEYS = {"home": "H", "end": "F"}
+
+
+def key_escape_sequence(key):
+    """The CSI bytes for a key herdr cannot send, or "" when `pane send-keys` should take it.
+
+    Accepts the same `+`-joined grammar as key_is_allowed, so `PageUp`, `pageup` and `ctrl+Home`
+    all resolve. An unknown or repeated modifier resolves to "" and is then refused by
+    key_is_allowed, rather than silently going out as the unmodified key.
+    """
+    if not isinstance(key, str) or not key:
+        return ""
+    *modifiers, base = key.split("+")
+    base = base.lower()
+    if base not in CSI_TILDE_KEYS and base not in CSI_LETTER_KEYS:
+        return ""
+    modifiers = [modifier.lower() for modifier in modifiers]
+    if len(set(modifiers)) != len(modifiers):
+        return ""
+    if not all(modifier in CSI_MODIFIER_BITS for modifier in modifiers):
+        return ""
+    code = 1 + sum(CSI_MODIFIER_BITS[modifier] for modifier in modifiers)
+    if base in CSI_TILDE_KEYS:
+        number = CSI_TILDE_KEYS[base]
+        return f"\x1b[{number}~" if code == 1 else f"\x1b[{number};{code}~"
+    letter = CSI_LETTER_KEYS[base]
+    return f"\x1b[{letter}" if code == 1 else f"\x1b[1;{code}{letter}"
+
+
+def key_is_allowed(key):
+    """True when herdr's key validator would accept `key` AND the relay is willing to send it.
+
+    Two shapes pass: a bare key (SAFE_KEYS, or any special name in any case), and a `+`-joined
+    chord whose modifiers are all in SAFE_MODIFIERS and whose base is a single printable character
+    or a special name -- herdr takes `alt+Up`, `shift+tab` and `ctrl+c` alike.
+
+    Bare single characters stay limited to SAFE_KEYS (y/n/a/digits) even though herdr would type
+    any of them: send_keys is for control, and free text has its own gated channels.
+
+    A repeated modifier (`ctrl+ctrl+c`) is refused HERE regardless of what herdr does with it --
+    it only ever arrives from a client bug, and forwarding a malformed chord into a live terminal
+    is not the way to find that out.
+    """
+    if not isinstance(key, str) or not key:
+        return False
+    if key in SAFE_KEYS or key.lower() in SAFE_SPECIAL_KEYS:
+        return True
+    if key_escape_sequence(key):
+        return True
+    if "+" not in key:
+        return False
+    *modifiers, base = key.split("+")
+    if not modifiers or not base:
+        return False
+    modifiers = [modifier.lower() for modifier in modifiers]
+    if not all(modifier in SAFE_MODIFIERS for modifier in modifiers):
+        return False
+    if len(set(modifiers)) != len(modifiers):
+        return False
+    if base.lower() in SAFE_SPECIAL_KEYS:
+        return True
+    return len(base) == 1 and base.isprintable()
 
 
 # --- Audit logging ---
@@ -233,7 +416,9 @@ def audit(action: str, ip: str, device: str, pane_id: str, detail: str = ""):
     """Append a write action to the audit log as structured JSONL."""
     import datetime
     entry = {
-        "ts": datetime.datetime.utcnow().isoformat() + "Z",
+        # Same wire format as before -- `Z`, not `+00:00` -- now that utcnow() is deprecated
+        # and warned once per audit() per process into the journal.
+        "ts": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
         "action": action,
         "paneId": pane_id,
         "ip": ip,
@@ -289,32 +474,176 @@ def _load_active_sessions():
         ACTIVE_SESSIONS[None if key == "local" else key] = value
 
 
+# --- Pane activity ledger ---
+def _load_activity():
+    """Read the ledger, dropping anything malformed and anything past the prune horizon.
+
+    Every field is checked because this file outlives the process that wrote it: a shape change, a
+    truncated write or a hand-edit must cost the unread column, not the relay's startup.
+    """
+    global pane_activity
+    if not os.path.isfile(ACTIVITY_FILE):
+        return
+    try:
+        with open(ACTIVITY_FILE) as f:
+            raw = json.load(f)
+    except Exception as e:
+        log.warning("could not read %s: %s", ACTIVITY_FILE, e)
+        return
+    if not isinstance(raw, dict):
+        return
+    now = time.time()
+    loaded = {}
+    for host, panes in raw.items():
+        if not isinstance(host, str) or not isinstance(panes, dict):
+            continue
+        for pane_id, entry in panes.items():
+            if not isinstance(pane_id, str) or not isinstance(entry, dict):
+                continue
+            active, seen = entry.get("active_at"), entry.get("seen_at")
+            # bool is an int in python, and `True` as a timestamp would sort every pane unread.
+            if any(isinstance(v, bool) or not isinstance(v, (int, float)) for v in (active, seen)):
+                continue
+            if now - max(active, seen) > ACTIVITY_PRUNE_AFTER:
+                continue
+            loaded[(host, pane_id)] = {"active_at": float(active), "seen_at": float(seen)}
+    pane_activity = loaded
+
+
+def _write_activity():
+    """BLOCKING. Temp file plus rename, so a crash mid-write cannot leave a half file behind that
+    then fails to parse and silently costs everyone's unread state."""
+    payload = {}
+    for (host, pane_id), entry in pane_activity.items():
+        payload.setdefault(host, {})[pane_id] = entry
+    tmp = ACTIVITY_FILE + ".tmp"
+    try:
+        with open(tmp, "w") as f:
+            json.dump(payload, f)
+        os.replace(tmp, ACTIVITY_FILE)
+    except Exception as e:
+        log.warning("could not persist %s: %s", ACTIVITY_FILE, e)
+
+
+async def flush_activity():
+    """Write now if anything changed. Called on shutdown; otherwise the debounce drives it."""
+    global _activity_dirty
+    if not _activity_dirty:
+        return
+    _activity_dirty = False
+    await asyncio.to_thread(_write_activity)
+
+
+async def _activity_flush_later():
+    await asyncio.sleep(ACTIVITY_FLUSH_DEBOUNCE)
+    await flush_activity()
+
+
+def _activity_mark_dirty():
+    global _activity_dirty, _activity_flush_task
+    _activity_dirty = True
+    if _activity_flush_task is not None and not _activity_flush_task.done():
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return  # no loop yet, or none any more -- flush_activity() still writes when asked
+    _activity_flush_task = loop.create_task(_activity_flush_later())
+
+
+def pane_host(pane_id):
+    """The host label a pane belongs to, from what the poll already recorded. The ledger's key half."""
+    return pane_remote_map.get(pane_id) or "local"
+
+
+def activity_ensure(host, pane_id):
+    """First sighting: seed active_at = seen_at = now, so the pane starts out exactly `seen`.
+
+    A client must never open on a screen full of unread alerts, so only transitions observed AFTER
+    the relay first saw a pane may mark it unread -- the same rule the blocked-push path already
+    applies by never firing on a first sighting.
+    """
+    if (host, pane_id) in pane_activity:
+        return
+    now = time.time()
+    pane_activity[(host, pane_id)] = {"active_at": now, "seen_at": now}
+    _activity_mark_dirty()
+
+
+def activity_note_active(host, pane_id):
+    """The agent moved. The only thing that can make a pane unread."""
+    held = pane_activity.get((host, pane_id))
+    now = time.time()
+    pane_activity[(host, pane_id)] = {
+        "active_at": now, "seen_at": held["seen_at"] if held else now,
+    }
+    _activity_mark_dirty()
+
+
+def activity_note_seen(pane_id):
+    """A client opened or drove this pane. Clears its unread state by construction.
+
+    Unknown panes are ignored rather than seeded: a client naming a pane the relay has never listed
+    would otherwise grow the file by one entry per bogus id.
+    """
+    if not pane_id or pane_id not in known_panes:
+        return
+    key = (pane_host(pane_id), pane_id)
+    held = pane_activity.get(key)
+    now = time.time()
+    pane_activity[key] = {"active_at": held["active_at"] if held else now, "seen_at": now}
+    _activity_mark_dirty()
+
+
+def activity_forget(host, pane_id):
+    """The pane is gone. Drop it so a reused pane id cannot inherit a dead pane's history."""
+    _activity_status.pop((host, pane_id), None)
+    if pane_activity.pop((host, pane_id), None) is not None:
+        _activity_mark_dirty()
+
+
+def activity_note_statuses(agents):
+    """Bump active_at wherever a status changed since this ledger last looked."""
+    for agent in agents:
+        key = (agent.get("host", "local"), agent["pane_id"])
+        status = agent.get("status")
+        if key in _activity_status and _activity_status[key] != status:
+            activity_note_active(*key)
+        _activity_status[key] = status
+
+
+def stamp_activity(records):
+    """Put the two timestamps on records about to go out, in MILLISECONDS -- every client that will
+    compare them is JavaScript, and a client should not have to know which unit this relay thinks in.
+    A pane with no entry carries neither key, and `isUnseen` is false for both absent."""
+    for record in records:
+        entry = pane_activity.get((record.get("host", "local"), record["pane_id"]))
+        if entry:
+            record["last_active_at"] = int(entry["active_at"] * 1000)
+            record["last_seen_at"] = int(entry["seen_at"] * 1000)
+
+
+
 def _save_active_sessions():
     payload = {("local" if k is None else k): v for k, v in ACTIVE_SESSIONS.items()}
     with open(ACTIVE_SESSIONS_FILE, "w") as f:
         json.dump(payload, f)
 
 
-async def send_web_push(title: str, body: str, url: str = "/", clear: bool = False):
-    """Send push notification to all registered subscriptions.
-    
-    Uses collapse topic + TTL so offline devices get only the latest.
-    If clear=True, sends a clear instruction instead of showing a notification.
+def _deliver_push(payload, headers):
+    """POST one payload to every subscription. BLOCKING -- pywebpush is requests underneath.
+
+    Works off a snapshot of push_subscriptions and drops dead ones BY VALUE: this runs on a
+    worker thread now, so a push_subscribe arriving mid-flight would invalidate any index
+    computed before it and pop somebody else's subscription.
     """
-    if not VAPID_PUBLIC_KEY or not VAPID_PRIVATE_KEY:
-        return
     try:
-        from pywebpush import webpush, WebPushException
+        from pywebpush import webpush
     except ImportError:
         log.warning("pywebpush not installed, skipping push")
         return
-    if clear:
-        payload = json.dumps({"type": "clear", "tag": "herdr-blocked"})
-    else:
-        payload = json.dumps({"title": title, "body": body, "url": url})
-    headers = {"Topic": "herdr-herd", "TTL": "21600"}  # 6h TTL, collapse key
     dead = []
-    for i, sub in enumerate(push_subscriptions):
+    for sub in list(push_subscriptions):
         try:
             webpush(
                 subscription_info=sub,
@@ -324,32 +653,96 @@ async def send_web_push(title: str, body: str, url: str = "/", clear: bool = Fal
                 headers=headers,
             )
         except Exception as e:
-            log.warning("Push failed for sub %d: %s", i, e)
+            log.warning("Push failed for %.60s: %s", (sub or {}).get("endpoint", "?"), e)
+            # 404/410 is the push service saying this subscription is retired, not a transient
+            # failure -- anything else keeps its subscription for the next notification.
             if "410" in str(e) or "404" in str(e):
-                dead.append(i)
+                dead.append(sub)
+    for sub in dead:
+        try:
+            push_subscriptions.remove(sub)
+        except ValueError:
+            pass
     if dead:
-        for i in reversed(dead):
-            push_subscriptions.pop(i)
         _save_push_subs()
+
+
+async def send_web_push(title: str, body: str, url: str = "/", clear: bool = False):
+    """Send push notification to all registered subscriptions.
+
+    Uses collapse topic + TTL so offline devices get only the latest.
+    If clear=True, sends a clear instruction instead of showing a notification.
+    """
+    if not VAPID_PUBLIC_KEY or not VAPID_PRIVATE_KEY:
+        return
+    if clear:
+        payload = json.dumps({"type": "clear", "tag": "herdr-blocked"})
+    else:
+        payload = json.dumps({"title": title, "body": body, "url": url})
+    headers = {"Topic": "herdr-herd", "TTL": "21600"}  # 6h TTL, collapse key
+    await asyncio.to_thread(_deliver_push, payload, headers)
 
 _load_push_subs()
 _load_active_sessions()
+_load_activity()
+
+
+def _ssh_base_args():
+    """SSH options every remote invocation shares, with connection reuse where it is available.
+
+    The poll loop dials every configured host once per POLL_INTERVAL, and each dial used to be a
+    full TCP + auth handshake -- 30 handshakes a minute per host at a 2s interval. ControlMaster
+    keeps one connection alive across ticks instead. `%C` hashes user/host/port into a
+    fixed-width name so the control socket path stays inside the ~104-byte AF_UNIX limit; if the
+    path would still be too long, or we are on Windows (whose OpenSSH has no multiplexing), we
+    simply run without it rather than break every remote read.
+    """
+    base = ["-o", "ConnectTimeout=5", "-o", "BatchMode=yes"]
+    if sys.platform == "win32":
+        return base
+    control_path = os.environ.get("HERDR_SSH_CONTROL_PATH") or os.path.join(LOG_DIR, "ssh-%C")
+    if len(control_path) > 90:
+        log.warning("SSH control path too long (%d chars); running without multiplexing", len(control_path))
+        return base
+    return base + [
+        "-o", "ControlMaster=auto",
+        "-o", f"ControlPath={control_path}",
+        "-o", "ControlPersist=60s",
+    ]
+
+
+SSH_BASE_ARGS = _ssh_base_args()
+
+
+def _remote_lock(remote):
+    """One lock per SSH target, so concurrent readers queue instead of racing the connection."""
+    with _remote_locks_guard:
+        remote_lock = _remote_locks.get(remote)
+        if remote_lock is None:
+            remote_lock = threading.Lock()
+            _remote_locks[remote] = remote_lock
+        return remote_lock
 
 
 def _invoke_herdr(*args, remote=None):
+    """Run one herdr command, locally or over SSH. BLOCKING -- never call this from the loop.
+
+    Every herdr call is a subprocess. Locally that is a few ms, but a read reaching past the
+    viewport costs seconds and an SSH call can run to the timeout below, and for that whole time
+    an inline caller serves no other client, runs no poll tick and sends no broadcast. Everything
+    reachable from async code goes through asyncio.to_thread.
+
+    Only the SSH branch touches shared state (_remote_locks, behind _remote_locks_guard), so the
+    worker threads need no further synchronising.
+    """
     session = active_session_for(remote)
     if remote:
-        cmd = ["ssh", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes", remote]
+        cmd = ["ssh", *SSH_BASE_ARGS, remote]
         if session:
             # An env= would not survive ssh; the remote shell applies this.
             cmd.append(f"HERDR_SESSION={session}")
         cmd += [REMOTE_HERDR, *args]
-        with _remote_locks_guard:
-            remote_lock = _remote_locks.get(remote)
-            if remote_lock is None:
-                remote_lock = threading.Lock()
-                _remote_locks[remote] = remote_lock
-        with remote_lock:
+        with _remote_lock(remote):
             return subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15)
 
     cmd = [HERDR, *args]
@@ -357,6 +750,21 @@ def _invoke_herdr(*args, remote=None):
         cmd, capture_output=True, text=True, encoding="utf-8",
         errors="replace", timeout=15, env=_herdr_env(session),
     )
+
+
+def transcript_ssh(remote, script, ssh_args=()):
+    """Run a transcript probe on a remote host, behind the same per-host lock as everything else.
+
+    Bytes, not text: the reply is a framed header plus a raw tail of the transcript, and the cut
+    has to be made on a byte boundary before anything tries to decode it.
+    """
+    cmd = ["ssh", *ssh_args, remote, "sh -c " + shlex.quote(script)]
+    with _remote_lock(remote):
+        proc = subprocess.run(cmd, capture_output=True, timeout=transcript.REMOTE_TIMEOUT)
+    if proc.returncode != 0:
+        log.warning("transcript ssh on %s exited %s: %s", remote, proc.returncode,
+                    proc.stderr.decode("utf-8", "replace").strip()[:200])
+    return proc.returncode, proc.stdout
 
 
 def run_herdr_result(*args, remote=None):
@@ -392,39 +800,260 @@ def get_workspace_labels(remote=None):
         return {}
 
 
-def get_agents_from_host(remote=None):
+def activity_title(title, agent):
+    """The terminal title, but only when it carries something the cwd does not.
+
+    herdr passes the pane's terminal title straight through, and a claude that is working sets it
+    to what it is doing ("fix P0, draft the P1 plan"). Idle and done panes are the problem: of the
+    nine agent panes on the host this was measured on, seven reported no title at all and two
+    reported the plain banner "Claude Code" -- which is the harness's name, already in the `agent`
+    field right beside it, and worth less than the cwd a client would drop to show it. Match the
+    banner by prefix so codex and opencode get the same treatment without a per-harness list, and
+    so a title that merely mentions the harness ("Claude Code: fix the poll") survives.
+    """
+    title = (title or "").strip()
+    if not title:
+        return ""
+    flattened = re.sub(r"[^a-z0-9]", "", title.lower())
+    if agent and flattened.startswith(re.sub(r"[^a-z0-9]", "", agent.lower())):
+        return ""
+    return title
+
+
+def pane_session_ref(pane):
+    """The agent-session ref herdr reports for a pane, or None when it can't be trusted.
+
+    herdr keeps reporting the LAST session a pane announced, so relaunching a pane under a
+    different harness leaves the previous one's ref behind (a pane running pi still advertising a
+    claude uuid). The ref carries its own `agent` name, so compare it against the pane's before
+    believing it; a server that omits the field stays permissive.
+    """
+    session = pane.get("agent_session")
+    if not isinstance(session, dict):
+        return None
+    if session.get("kind") not in {"id", "path"} or not session.get("value"):
+        return None
+    reported = session.get("agent")
+    if reported and reported != pane.get("agent"):
+        return None
+    return session
+
+
+def shell_pane_record(pane, host_label, remote):
+    """The payload for a pane with no agent in it.
+
+    Deliberately NOT an `agents` entry. Six clients render that array and every one of them
+    assumes its entries are agents; a shell pane would show up in all of them as a card with an
+    empty harness name. It also has none of what an agent entry carries -- herdr reports
+    `agent_status: "unknown"` for all 20 of them here, there is no session and no terminal title
+    field at all. What it has is a cwd, a place in the hierarchy, and one thing an agent pane
+    never has: a real scrollback ring.
+    """
+    scroll = pane.get("scroll") or {}
+    return {
+        "pane_id": pane["pane_id"],
+        # herdr allows a label on any pane but nothing sets one by default -- all 20 here report
+        # null, so clients fall back to project/pane_id and `rename_agent` is the way to fix that.
+        "label": pane.get("label") or "",
+        "cwd": pane.get("cwd", ""),
+        "project": os.path.basename(pane.get("cwd", "")),
+        "host": host_label,
+        "remote": remote,
+        "workspace_id": pane.get("workspace_id", ""),
+        "tab_id": pane.get("tab_id", ""),
+        "focused": bool(pane.get("focused")),
+        # The reason scrollback is worth offering here and not on an agent pane: measured 34-693
+        # rows on the shell panes of this host against a flat 0 on every agent pane, and a
+        # 400-line `recent` read costs 5ms rather than herdr's multi-second harvest, because
+        # there is a real ring to read instead of a TUI to walk.
+        "scrollback": scroll.get("max_offset_from_bottom", 0),
+        "viewport_rows": scroll.get("viewport_rows", 0),
+    }
+
+
+def list_panes_from_host(remote=None):
+    """One `pane list`, split into (agents, shell panes).
+
+    Split here rather than in two functions because the CLI call is the expensive part -- 12ms
+    locally, a full SSH round trip remotely -- and the poll runs it every POLL_INTERVAL.
+    """
     raw = run_herdr("pane", "list", remote=remote)
     host_label = remote or "local"
     try:
         data = json.loads(raw)
         panes = data.get("result", {}).get("panes", [])
         workspace_labels = get_workspace_labels(remote=remote) if panes else {}
-        return [
-            {
-                "pane_id": p["pane_id"],
-                "agent": p.get("agent", ""),
-                "label": p.get("label", ""),
-                # Names the space, and stands in for panes that have no label.
-                "workspace_label": workspace_labels.get(p.get("workspace_id", ""), ""),
-                "status": p.get("agent_status", "unknown"),
-                "cwd": p.get("cwd", ""),
-                "project": os.path.basename(p.get("cwd", "")),
-                "host": host_label,
-                "remote": remote,
-                "workspace_id": p.get("workspace_id", ""),
-                "tab_id": p.get("tab_id", ""),
-            }
-            for p in panes if p.get("agent")
-        ]
     except (json.JSONDecodeError, KeyError):
-        return []
+        return [], []
+
+    agents, shells = [], []
+    for p in panes:
+        if not p.get("agent"):
+            if SHELL_PANES and p.get("pane_id"):
+                shells.append(shell_pane_record(p, host_label, remote))
+            continue
+        session = pane_session_ref(p)
+        if session:
+            pane_session_map[p["pane_id"]] = session
+        else:
+            pane_session_map.pop(p["pane_id"], None)
+        # `scroll` says what a scrollback read could ever yield: an agent on the alternate screen
+        # reports max_offset_from_bottom 0 (verified across every agent pane on this host), so a
+        # client can tell "nothing behind the viewport, don't offer to load older" from "there are
+        # 9k lines back there" without a probe read. Shell panes are the ones with a ring; they
+        # aren't listed yet, but the field is theirs too.
+        scroll = p.get("scroll") or {}
+        agents.append({
+            "pane_id": p["pane_id"],
+            "agent": p.get("agent", ""),
+            "label": p.get("label", ""),
+            # Names the space, and stands in for panes that have no label.
+            "workspace_label": workspace_labels.get(p.get("workspace_id", ""), ""),
+            "status": p.get("agent_status", "unknown"),
+            "cwd": p.get("cwd", ""),
+            "project": os.path.basename(p.get("cwd", "")),
+            "host": host_label,
+            "remote": remote,
+            "workspace_id": p.get("workspace_id", ""),
+            "tab_id": p.get("tab_id", ""),
+            # A working claude sets its terminal title to what it is doing, so this is live
+            # activity rather than a stable session name. Idle and done panes report either
+            # nothing or the harness's own banner, which says less than the cwd it would
+            # displace on a client, so activity_title drops those.
+            "title": activity_title(p.get("terminal_title_stripped"), p.get("agent", "")),
+            # Which pane herdr itself has in front. Exactly one pane per host is focused, so a
+            # client can mark where the operator actually is, and offer to move them (see the
+            # `focus` message) instead of only ever listing.
+            "focused": bool(p.get("focused")),
+            "scrollback": scroll.get("max_offset_from_bottom", 0),
+            "viewport_rows": scroll.get("viewport_rows", 0),
+            # Whether this pane names a transcript at all -- the client's cue for offering a
+            # history view. The ref itself stays in pane_session_map.
+            "has_session": session is not None,
+        })
+    return agents, shells
+
+
+def pane_process(pane_id, remote=None):
+    """What is actually running in a pane.
+
+    Shell panes are the ones that need this: measured on this host, 20 of them share only 12
+    distinct cwd basenames, so eight are indistinguishable from a sibling by directory alone.
+    `pane process-info` separates them -- zsh from vim from the build that has been running an
+    hour -- for 2.5ms locally. But it is one call per pane, which is one SSH round trip per pane,
+    so it is never done for a list; clients ask for it on the pane they are opening.
+    """
+    raw = run_herdr("pane", "process-info", "--pane", pane_id, remote=remote)
+    try:
+        info = json.loads(raw).get("result", {}).get("process_info", {})
+        foreground = (info.get("foreground_processes") or [{}])[0]
+    except (json.JSONDecodeError, AttributeError, TypeError, IndexError):
+        return {}
+    if not isinstance(foreground, dict):
+        return {}
+    name = (foreground.get("name") or "").strip()
+    if not name:
+        return {}
+    # Both are the pane's own process table, so they are as trustworthy as anything else herdr
+    # reports -- but they end up in a client's UI, so they get the same length ceiling as a label.
+    return {"name": name[:64], "cmdline": (foreground.get("cmdline") or "").strip()[:200]}
+
+
+def pane_layout(pane_id, remote=None):
+    """`pane layout` for the tab holding a pane: every pane's rect plus which one is focused."""
+    raw = run_herdr("pane", "layout", "--pane", pane_id, remote=remote)
+    try:
+        layout = json.loads(raw).get("result", {}).get("layout", {})
+    except (json.JSONDecodeError, AttributeError):
+        return None
+    if not isinstance(layout, dict) or not layout.get("panes"):
+        return None
+    return layout
+
+
+def walk_direction(current, target):
+    """Which way herdr should step to get from one pane's rect towards another's.
+
+    Rects are in terminal cells, and a cell is about twice as tall as it is wide, so comparing a
+    raw dx against a raw dy picks the wrong axis on splits that look square on screen. Overlap
+    decides it without a fudge factor: two panes that share rows are side by side, whatever the
+    numbers say, and only when they share none is the move vertical.
+    """
+    cx0, cy0 = current.get("x", 0), current.get("y", 0)
+    cx1, cy1 = cx0 + current.get("width", 0), cy0 + current.get("height", 0)
+    tx0, ty0 = target.get("x", 0), target.get("y", 0)
+    tx1, ty1 = tx0 + target.get("width", 0), ty0 + target.get("height", 0)
+    if ty0 < cy1 and cy0 < ty1:
+        if tx0 >= cx1:
+            return "right"
+        if tx1 <= cx0:
+            return "left"
+    if ty0 >= cy1:
+        return "down"
+    if ty1 <= cy0:
+        return "up"
+    # Nested or overlapping rects -- a zoomed pane, or a layout this does not model. Fall back to
+    # whichever centre is further away, so the walk still makes progress instead of refusing.
+    if abs((tx0 + tx1) - (cx0 + cx1)) >= abs((ty0 + ty1) - (cy0 + cy1)):
+        return "right" if tx0 + tx1 > cx0 + cx1 else "left"
+    return "down" if ty0 + ty1 > cy0 + cy1 else "up"
+
+
+def focus_shell_pane(pane_id, tab_id, remote=None):
+    """Focus a pane herdr has no command for.
+
+    `agent focus` takes a pane and walks up to the tab and workspace holding it. There is no
+    equivalent for a pane without an agent: `pane focus` only steps to a *neighbour*, by
+    direction. So the tab is focused first, and then the pane is reached one step at a time.
+
+    Each step re-reads the layout rather than plotting the whole route from the first one.
+    "The pane to the right" is herdr's notion and not ours, so a route computed up front would
+    land somewhere else and report success; re-reading also catches the step that moved nothing
+    -- a wall, or a layout walk_direction does not model -- and stops instead of looping.
+
+    Costs one `pane layout` per step plus one `pane focus`: about six CLI calls for a four-pane
+    tab, 15ms locally. It is user-initiated, never on a timer.
+    """
+    if tab_id and not _mutate_herdr("tab", "focus", tab_id, remote=remote):
+        return False
+    previous = None
+    for _ in range(PANE_WALK_LIMIT):
+        layout = pane_layout(pane_id, remote=remote)
+        if layout is None:
+            return False
+        focused = layout.get("focused_pane_id")
+        if focused == pane_id:
+            return True
+        if focused == previous:
+            log.warning("pane walk stalled on %s heading for %s", focused, pane_id)
+            return False
+        rects = {p.get("pane_id"): (p.get("rect") or {}) for p in layout.get("panes", [])}
+        if focused not in rects or pane_id not in rects:
+            return False
+        previous = focused
+        if not _mutate_herdr("pane", "focus", "--direction",
+                             walk_direction(rects[focused], rects[pane_id]),
+                             "--pane", focused, remote=remote):
+            return False
+    log.warning("pane walk gave up after %d steps heading for %s", PANE_WALK_LIMIT, pane_id)
+    return False
+
+
+def get_agents_from_host(remote=None):
+    return list_panes_from_host(remote=remote)[0]
+
+
+def get_all_panes():
+    agents, shells = list_panes_from_host(remote=None)
+    for remote in REMOTES:
+        more_agents, more_shells = list_panes_from_host(remote=remote)
+        agents.extend(more_agents)
+        shells.extend(more_shells)
+    return agents, shells
 
 
 def get_all_agents():
-    agents = get_agents_from_host(remote=None)
-    for remote in REMOTES:
-        agents.extend(get_agents_from_host(remote=remote))
-    return agents
+    return get_all_panes()[0]
 
 
 def get_sessions(remote=None):
@@ -453,22 +1082,52 @@ def get_sessions(remote=None):
     return sessions
 
 
-def update_pane_maps(agents):
+def update_pane_maps(agents, shells=()):
+    """Register what the poll just saw, and forget what it didn't.
+
+    `shells` defaults to empty so a caller that only has agents cannot accidentally evict every
+    shell pane through the stale sweep below -- passing nothing means "no opinion", not "there
+    are none". Callers that list both pass both.
+    """
     current_pane_ids = {agent["pane_id"] for agent in agents}
+    if shells:
+        current_pane_ids |= {pane["pane_id"] for pane in shells}
+    else:
+        # No shell list means the caller has no opinion about shell panes, not that there are
+        # none -- keep the ones already known instead of sweeping every one of them as stale.
+        current_pane_ids |= set(shell_pane_map)
     for agent in agents:
         pane_id = agent["pane_id"]
         pane_remote_map[pane_id] = agent.get("remote")
         known_panes.add(pane_id)
         agent_cache[pane_id] = agent
+        activity_ensure(agent.get("host", "local"), pane_id)
+    for pane in shells:
+        pane_id = pane["pane_id"]
+        pane_remote_map[pane_id] = pane.get("remote")
+        known_panes.add(pane_id)
+        shell_pane_map[pane_id] = pane
+        activity_ensure(pane.get("host", "local"), pane_id)
+    activity_note_statuses(agents)
 
     stale = known_panes - current_pane_ids
     if stale:
         known_panes.difference_update(stale)
         for pane_id in stale:
+            # Before pane_remote_map loses the pane, since that map is what names its host. Reusing
+            # this sweep rather than reconciling the ledger separately is deliberate: the guard on
+            # `shells` above already decides when the caller has a full enough picture to forget
+            # anything, and a second policy beside it would be a second thing to keep true.
+            activity_forget(pane_host(pane_id), pane_id)
             pane_remote_map.pop(pane_id, None)
+            pane_session_map.pop(pane_id, None)
             last_statuses.pop(pane_id, None)
             last_blocked_prompts.pop(pane_id, None)
             agent_cache.pop(pane_id, None)
+            shell_pane_map.pop(pane_id, None)
+    # Last, so the records carry whatever this call just seeded or bumped.
+    stamp_activity(agents)
+    stamp_activity(shells)
 
 
 POLL_GENERATION = 0
@@ -514,22 +1173,44 @@ def _source_key(host):
     raise KeyError(host)
 
 
-def apply_session_switch(host, session, ip="", device=""):
+def session_switch_names(host):
+    """Session names a switch to `host` may name, or None when the host is unknown.
+
+    BLOCKING -- one `herdr session list`, which is an ssh round trip for a remote. Split out of
+    apply_session_switch so a caller on the event loop can read this on a worker thread and still
+    run the mutation itself: reset_pane_state drains an asyncio.Queue and bumps POLL_GENERATION,
+    neither of which is safe off the loop thread.
+    """
+    try:
+        source = _source_key(host)
+    except KeyError:
+        return None
+    return {entry["name"] for entry in get_sessions(remote=source)}
+
+
+def apply_session_switch(host, session, ip="", device="", *, names):
     """Point one source at a session. Returns (ok, error_message, changed).
+
+    `names` is the allowlist a named session is checked against -- read it with
+    session_switch_names, off the loop. It is keyword-only and has no default on purpose: this
+    function must NOT be able to reach a blocking call, and a caller that omits the allowlist
+    should fail loudly rather than fall back to reading it here. A falsy `names` therefore
+    rejects every named session; only `session=None` (follow herdr's own default) still passes.
 
     `changed` is False on the no-op path (already-active selection) and on
     any rejection, True only when ACTIVE_SESSIONS was actually mutated.
     Callers must skip the broadcast + re-poll when it's False -- that's the
     expensive part the no-op short-circuit below exists to avoid, and it is
     defeated if the caller runs it anyway.
+
+    Must run on the event-loop thread: reset_pane_state below is not thread-safe.
     """
     try:
         source = _source_key(host)
     except KeyError:
         return False, f"unknown host: {host}", False
 
-    # Re-selecting the already-active session is a no-op: skip the blocking
-    # `herdr session list` call and, crucially, the pane-state reset below.
+    # Re-selecting the already-active session is a no-op: skip the pane-state reset below.
     # `source in ACTIVE_SESSIONS` (not `.get()`) matters here -- a key that
     # has never been set is not the same thing as an explicit None value.
     if source in ACTIVE_SESSIONS and ACTIVE_SESSIONS[source] == session:
@@ -540,8 +1221,7 @@ def apply_session_switch(host, session, ip="", device=""):
             # session lands in a set-membership check next; a list/dict is
             # unhashable there and would raise instead of being rejected.
             return False, f"unknown session: {session}", False
-        names = {s["name"] for s in get_sessions(remote=source)}
-        if session not in names:
+        if session not in (names or frozenset()):
             return False, f"unknown session: {session}", False
 
     ACTIVE_SESSIONS[source] = session
@@ -576,12 +1256,10 @@ def sessions_message():
 
 async def broadcast_sessions():
     gen = POLL_GENERATION
-    msg = sessions_message()
-    # This guard cannot fire today: sessions_message -> get_sessions ->
-    # run_herdr -> subprocess.run is entirely synchronous, so nothing can
-    # bump POLL_GENERATION between the two lines above. It stays correct
-    # and becomes load-bearing the moment that chain gains an await (e.g.
-    # a future to_thread fix for the blocking subprocess call).
+    msg = await asyncio.to_thread(sessions_message)
+    # This guard is load-bearing now that the line above yields: sessions_message runs one
+    # `herdr session list` per source on a worker thread, so a session_switch CAN land while
+    # this message is being built, and the message it would carry is then already wrong.
     #
     # It does NOT cover the real staleness window: broadcast() below awaits
     # ws.send() once per client, so a switch landing mid fan-out can still
@@ -594,82 +1272,176 @@ async def broadcast_sessions():
     await broadcast(msg)
 
 
-CLAUDE_SESSION_ROOT = os.path.join(
-    os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude"), "projects"
-)
+# How often the tab/workspace hierarchy is re-read, in poll ticks. `pane list` already carries
+# every pane's workspace_id and tab_id, but only the ids: the labels the operator sees, the
+# numbering, and which one is focused live in `workspace list` and `tab list`. Two more CLI calls
+# per host -- 4ms each locally, one SSH round trip each remotely -- against a hierarchy that only
+# changes when someone creates, closes, renames or focuses something. So: its own slower cadence,
+# plus a forced refresh after any message that moves it (see spaces_dirty).
+SPACES_POLL_INTERVAL = 5
+spaces_dirty = True
+_spaces_ticks = 0
 
 
-def claude_project_slug(cwd):
-    """Claude Code's directory name for a working directory.
+def get_spaces_from_host(remote=None):
+    """The workspaces and tabs one herdr reports, flattened and tagged with their host."""
+    host_label = remote or "local"
+    workspaces = []
+    tabs = []
 
-    Every non-alphanumeric character becomes '-'. Claude Code additionally
-    truncates names past 200 characters and appends a hash of the full path;
-    those projects simply read as "no history" here rather than mis-resolving
-    to another project's log.
-    https://code.claude.com/docs/en/sessions#where-transcripts-are-stored
-    """
-    return re.sub(r"[^a-zA-Z0-9]", "-", cwd)
-
-
-def read_session_transcript(cwd, limit=40):
-    """Recent conversation turns from Claude Code's session log for `cwd`.
-
-    Claude Code writes one JSONL per session to
-    <session root>/<project slug>/<session-id>.jsonl. Returns
-    [{"role", "content"}] oldest first, or [] when there is no readable log.
-    """
-    if not cwd:
-        return []
-    session_dir = os.path.join(CLAUDE_SESSION_ROOT, claude_project_slug(cwd))
+    raw = run_herdr("workspace", "list", remote=remote)
     try:
-        logs = [
-            os.path.join(session_dir, name)
-            for name in os.listdir(session_dir)
-            if name.endswith(".jsonl")
-        ]
-        # ponytail: newest file wins. Two panes sharing a cwd therefore share a
-        # transcript; key off a session id here if herdr ever exposes one.
-        newest = max(logs, key=os.path.getmtime)
-    except (OSError, ValueError):
-        return []
+        listed = json.loads(raw).get("result", {}).get("workspaces", [])
+    except (json.JSONDecodeError, AttributeError):
+        listed = []
+    for w in listed:
+        if not w.get("workspace_id"):
+            continue
+        worktree = w.get("worktree") or {}
+        workspaces.append({
+            "workspace_id": w["workspace_id"],
+            # herdr's own label -- the repo or directory name the operator named the space, not
+            # the basename of some pane's cwd, which is what a client has to guess from `agents`.
+            "label": w.get("label", ""),
+            "number": w.get("number", 0),
+            "focused": bool(w.get("focused")),
+            "tab_count": w.get("tab_count", 0),
+            # Every pane, agent or not. The relay only lists agent panes, so the difference is
+            # exactly how much of this workspace a client cannot see yet.
+            "pane_count": w.get("pane_count", 0),
+            "active_tab_id": w.get("active_tab_id", ""),
+            "repo": worktree.get("repo_name", ""),
+            "host": host_label,
+            "remote": remote,
+        })
 
+    raw = run_herdr("tab", "list", remote=remote)
     try:
-        with open(newest, encoding="utf-8", errors="replace") as handle:
-            # Transcripts reach tens of MB; only the tail is ever displayed, so
-            # stream the file and keep a bounded window instead of reading it.
-            tail = collections.deque(handle, maxlen=400)
-    except OSError:
-        return []
+        listed = json.loads(raw).get("result", {}).get("tabs", [])
+    except (json.JSONDecodeError, AttributeError):
+        listed = []
+    for t in listed:
+        if not t.get("tab_id"):
+            continue
+        tabs.append({
+            "tab_id": t["tab_id"],
+            "workspace_id": t.get("workspace_id", ""),
+            # Defaults to the tab number as a string, so it is only interesting once someone
+            # renames it -- but then it is the only place that name exists.
+            "label": t.get("label", ""),
+            "number": t.get("number", 0),
+            "focused": bool(t.get("focused")),
+            "pane_count": t.get("pane_count", 0),
+            "host": host_label,
+            "remote": remote,
+        })
 
-    messages = []
-    for line in tail:
-        try:
-            row = json.loads(line)
-        except ValueError:
-            continue
-        role = row.get("type")
-        if role not in ("user", "assistant"):
-            continue
-        content = (row.get("message") or {}).get("content")
-        if isinstance(content, str):
-            text = content
-        elif isinstance(content, list):
-            # Prose only: tool_use and tool_result blocks are not conversation.
-            text = "\n".join(
-                block["text"]
-                for block in content
-                if isinstance(block, dict) and block.get("type") == "text"
-            )
-        else:
-            continue
-        text = text.strip()
-        if text:
-            messages.append({"role": role, "content": text})
-    return messages[-limit:]
+    return workspaces, tabs
+
+
+def get_all_spaces():
+    workspaces, tabs = get_spaces_from_host(remote=None)
+    for remote in REMOTES:
+        more_workspaces, more_tabs = get_spaces_from_host(remote=remote)
+        workspaces.extend(more_workspaces)
+        tabs.extend(more_tabs)
+    return {"workspaces": workspaces, "tabs": tabs}
+
+
+def update_space_maps(spaces):
+    workspace_remote_map.clear()
+    tab_remote_map.clear()
+    for w in spaces["workspaces"]:
+        workspace_remote_map[(w["host"], w["workspace_id"])] = w["remote"]
+    for t in spaces["tabs"]:
+        tab_remote_map[(t["host"], t["tab_id"])] = t["remote"]
+
+
+def refresh_spaces(force=False):
+    """Re-read the hierarchy when it is due, and return whatever the cache holds now."""
+    global spaces_dirty, _spaces_ticks
+    if force or spaces_dirty or _spaces_ticks % SPACES_POLL_INTERVAL == 0:
+        spaces = get_all_spaces()
+        # An empty result means the CLI call failed (herdr always has at least one workspace);
+        # keep the last good hierarchy rather than blanking every client's chip strip.
+        if spaces["workspaces"]:
+            spaces_cache["workspaces"] = spaces["workspaces"]
+            spaces_cache["tabs"] = spaces["tabs"]
+            update_space_maps(spaces_cache)
+        spaces_dirty = False
+    _spaces_ticks += 1
+    return spaces_cache
+
+
+def mark_spaces_dirty():
+    """Ask the next poll to re-read the hierarchy instead of waiting out the slow cadence."""
+    global spaces_dirty
+    spaces_dirty = True
+
+
+def resolve_space(kind, ident, host=""):
+    """Which host owns this workspace/tab id, as (ok, remote, error).
+
+    Ids are unique per herdr, not across hosts: two machines both call their first workspace w1.
+    A client that sees more than one host therefore has to say which one it means. Clients that
+    send no host are served while the id is unambiguous and refused when it is not -- guessing
+    would mutate a tab on the wrong machine.
+    """
+    table = workspace_remote_map if kind == "workspace" else tab_remote_map
+    if not ident:
+        return False, None, f"{kind}_id required"
+    if host:
+        if (host, ident) not in table:
+            return False, None, f"unknown {kind}_id"
+        return True, table[(host, ident)], ""
+    matches = {h: r for (h, i), r in table.items() if i == ident}
+    if not matches:
+        return False, None, f"unknown {kind}_id"
+    if len(matches) > 1:
+        return False, None, f"{kind}_id {ident} exists on {', '.join(sorted(matches))}; host required"
+    return True, next(iter(matches.values())), ""
+
+
+# A label a client wants written into herdr's own UI, or "" if it is not one.
+MAX_LABEL_LEN = 64
+
+
+def clean_label(label):
+    """Collapse a client-supplied name to something safe to hand a CLI as a positional argument.
+
+    A leading dash would be parsed as a flag, and a newline or control character would be written
+    straight into herdr's tab strip, so neither survives.
+    """
+    label = re.sub(r"[\x00-\x1f\x7f]", " ", str(label or "")).strip()
+    if not label or label.startswith("-") or len(label) > MAX_LABEL_LEN:
+        return ""
+    return label
+
+
+# Source for every read the relay makes on its own initiative (poll loop, respond, send_keys).
+#
+# `visible` -- the rendered viewport -- NOT `recent`. In text format a `recent` read of more lines
+# than the pane is tall makes herdr harvest an alt-screen agent's scrollback through the agent's
+# own mouse-scroll interface. Measured on herdr 0.8.0: 200 lines took 6.2s, 400 took 12.7s
+# (~31ms/line), it only works while the agent is idle, it is not even deterministic (a first
+# attempt returned the viewport and nothing else), and the operator watches their terminal scroll
+# up and snap back once per read. This function runs on every poll tick for every blocked pane and
+# again before every respond/send_keys, so it has to be free. `visible` is immune by construction:
+# it IS the rendered grid, clamped to it however many lines are asked for.
+#
+# The conversation history the harvest was reaching for is not this function's job -- see
+# get_history: it belongs in the agent's own transcript, which has real message boundaries and
+# costs nothing.
+PROMPT_READ_SOURCE = "visible"
+
+# Sources herdr accepts on `pane read` (CLI spelling -- the socket wants recent_unwrapped, the CLI
+# wants recent-unwrapped), and the line ceiling herdr silently enforces.
+READ_SOURCES = {"visible", "recent", "recent-unwrapped", "detection"}
+MAX_READ_LINES = 1000
 
 
 def read_pane(pane_id, remote=None):
-    raw = run_herdr("pane", "read", pane_id, "--lines", "100", "--source", "recent", remote=remote)
+    raw = run_herdr("pane", "read", pane_id, "--lines", "100", "--source", PROMPT_READ_SOURCE, remote=remote)
     lines = [l for l in raw.splitlines() if l.strip() and not CHROME_RE.search(l)]
     display_lines = lines[-50:]
     question = detect_question("\n".join(lines))
@@ -935,14 +1707,18 @@ async def broadcast(msg):
     clients.difference_update(dead)
 
 async def send_current_snapshot(ws):
-    await ws.send(json.dumps(sessions_message()))
-    agents = get_all_agents()
-    update_pane_maps(agents)
-    await ws.send(json.dumps({"type": "agents", "agents": agents}))
+    await ws.send(json.dumps(await asyncio.to_thread(sessions_message)))
+    agents, shells = await asyncio.to_thread(get_all_panes)
+    update_pane_maps(agents, shells)
+    # Force the hierarchy read: a client that just connected has no chip strip at all, and
+    # waiting out the slow cadence would show it agents filed under ids for a few seconds.
+    spaces = await asyncio.to_thread(refresh_spaces, force=True)
+    await ws.send(json.dumps(
+        {"type": "agents", "agents": agents, "spaces": spaces, "panes": shells}))
     for agent in agents:
         if agent["status"] != "blocked":
             continue
-        content = read_pane(agent["pane_id"], remote=agent.get("remote"))
+        content = await asyncio.to_thread(read_pane, agent["pane_id"], remote=agent.get("remote"))
         await ws.send(json.dumps(blocked_message(
             agent["pane_id"],
             agent["agent"],
@@ -967,16 +1743,18 @@ async def poll_loop():
 
 async def _poll_once():
         gen = POLL_GENERATION
-        agents = get_all_agents()
-        update_pane_maps(agents)
+        agents, shells = await asyncio.to_thread(get_all_panes)
+        update_pane_maps(agents, shells)
         # Always broadcast (even empty list) so clients stay in sync
-        await broadcast({"type": "agents", "agents": agents})
+        spaces = await asyncio.to_thread(refresh_spaces)
+        await broadcast(
+            {"type": "agents", "agents": agents, "spaces": spaces, "panes": shells})
         if gen != POLL_GENERATION:
             return          # a switch landed; this snapshot is stale
         for a in agents:
             pid, status = a["pane_id"], a["status"]
             if status == "blocked":
-                content = read_pane(pid, remote=a.get("remote"))
+                content = await asyncio.to_thread(read_pane, pid, remote=a.get("remote"))
                 message = blocked_message(
                     pid,
                     a["agent"],
@@ -1028,7 +1806,7 @@ async def event_push():
         event_remote = pane_remote_map.get(pane_id)
 
         if pane_id and event.get("type") == "agent_event":
-            agents = get_all_agents()
+            agents, shells = await asyncio.to_thread(get_all_panes)
             if status == "blocked" and not any(
                 agent["pane_id"] == pane_id for agent in agents
             ):
@@ -1041,8 +1819,8 @@ async def event_push():
                     "host": host,
                     "remote": event_remote,
                 })
-            update_pane_maps(agents)
-            await broadcast({"type": "agents", "agents": agents})
+            update_pane_maps(agents, shells)
+            await broadcast({"type": "agents", "agents": agents, "panes": shells})
             if gen != POLL_GENERATION:
                 continue        # a switch landed; this event is stale
             agent_cache[pane_id] = {**agent_cache.get(pane_id, {}), **agent_data}
@@ -1052,7 +1830,7 @@ async def event_push():
         if status == "blocked" and pane_id:
             remote = pane_remote_map.get(pane_id)
             if remote or host == "local":
-                content = read_pane(pane_id, remote=remote)
+                content = await asyncio.to_thread(read_pane, pane_id, remote=remote)
             else:
                 content = event.get("prompt", "Agent is blocked")
             message = blocked_message(
@@ -1078,19 +1856,74 @@ async def event_push():
             await broadcast(message)
 
 
+WEB_DIR = os.path.realpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "web"))
+
+# What the relay serves out of web/, keyed by extension: (content type, Cache-Control).
+#
+# The split is the interesting half. A font or a raster never changes without changing its name,
+# so a year of immutable caching is free. The stylesheet and the scripts DO change under a fixed
+# name on every deploy, and the previous table gave the one file it held -- a font -- that same
+# year. Handing it to app.css would have pinned every returning browser to whatever JavaScript it
+# saw first, with no way to invalidate short of renaming the files.
+#
+# `.html` is deliberately absent: index.html is served further up, behind the token when one is
+# configured, and adding it here would quietly turn the auth exemption below into a way past it.
+WEB_ASSET_TYPES = {
+    ".css": ("text/css; charset=utf-8", "no-cache"),
+    ".js": ("text/javascript; charset=utf-8", "no-cache"),
+    ".svg": ("image/svg+xml", "public, max-age=31536000, immutable"),
+    ".png": ("image/png", "public, max-age=31536000, immutable"),
+    ".woff2": ("font/woff2", "public, max-age=31536000, immutable"),
+    ".txt": ("text/plain; charset=utf-8", "public, max-age=31536000, immutable"),
+}
+
+
+def web_asset(request_path):
+    """(absolute path, content type, cache policy) for a static file under web/, or None.
+
+    Replaces a hand-maintained `path -> (filename, mime)` table, which was a standing bug rather
+    than a list: every file committed to web/ is public on Cloudflare Pages immediately, but over
+    the relay it 404s until someone remembers two more lines in two different places -- so a
+    missing asset only ever showed up for the people on a tunnel, which is the half nobody tests.
+    Splitting the app into modules would have made that table grow a line per file.
+
+    Cannot be talked out of web/. Every segment has to be a plain name, which rejects "", ".",
+    ".." and anything carrying a separator -- and the server has already percent-decoded, so that
+    covers the %2e%2e spellings too. The resolved path is then checked to still be inside web/,
+    which is what catches a symlink pointing out of the tree.
+    """
+    if not isinstance(request_path, str) or not request_path.startswith("/"):
+        return None
+    segments = request_path[1:].split("/")
+    separators = {os.sep, os.altsep} - {None}
+    for segment in segments:
+        if segment in ("", ".", "..") or any(sep in segment for sep in separators):
+            return None
+    entry = WEB_ASSET_TYPES.get(os.path.splitext(segments[-1])[1].lower())
+    if entry is None:
+        return None
+    resolved = os.path.realpath(os.path.join(WEB_DIR, *segments))
+    if resolved != WEB_DIR and not resolved.startswith(WEB_DIR + os.sep):
+        return None
+    if not os.path.isfile(resolved):
+        return None
+    content_type, cache_control = entry
+    return resolved, content_type, cache_control
+
+
 async def process_request(connection, request):
     """Handle HTTP POST on the same port as WebSocket."""
     from websockets.http11 import Response
     from websockets.datastructures import Headers
 
-    public_paths = {
-        "/sw.js", "/logo.svg", "/api/vapid-public-key",
-        "/HackNerdFont-Regular.woff2", "/HackNerdFont-LICENSE.txt",
-    }
+    public_paths = {"/sw.js", "/api/vapid-public-key"}
     request_path = (request.path or "/").split("?", 1)[0]
 
-    # Token auth (if configured)
-    if AUTH_TOKEN and request_path not in public_paths:
+    # Token auth (if configured). Static assets under web/ are exempt because a browser fetches
+    # the stylesheet, the scripts and the fonts before anything has authenticated, and the
+    # service worker reads its notification icon with no session at all. index.html is NOT one of
+    # them -- see web_asset -- so the app itself stays behind the token exactly as before.
+    if AUTH_TOKEN and request_path not in public_paths and web_asset(request_path) is None:
         token = None
         for key, value in request.headers.raw_items():
             if key.lower() == "authorization":
@@ -1196,23 +2029,16 @@ async def process_request(connection, request):
             headers = Headers([("Content-Type", "image/svg+xml")])
             return Response(200, "OK", headers, body)
 
-    static_files = {
-        "/HackNerdFont-Regular.woff2": ("HackNerdFont-Regular.woff2", "font/woff2"),
-        "/HackNerdFont-LICENSE.txt": ("HackNerdFont-LICENSE.txt", "text/plain; charset=utf-8"),
-    }
-    if path in static_files:
-        filename, content_type = static_files[path]
-        asset_path = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), "..", "web", filename
-        )
-        if os.path.isfile(asset_path):
-            with open(asset_path, "rb") as f:
-                body = f.read()
-            headers = Headers([
-                ("Content-Type", content_type),
-                ("Cache-Control", "public, max-age=31536000, immutable"),
-            ])
-            return Response(200, "OK", headers, body)
+    asset = web_asset(path)
+    if asset:
+        asset_path, content_type, cache_control = asset
+        with open(asset_path, "rb") as f:
+            body = f.read()
+        headers = Headers([
+            ("Content-Type", content_type),
+            ("Cache-Control", cache_control),
+        ])
+        return Response(200, "OK", headers, body)
 
     # Fallback for unmatched paths
     headers = Headers([("Access-Control-Allow-Origin", "*")])
@@ -1259,6 +2085,11 @@ async def handle_client(ws):
             except json.JSONDecodeError:
                 continue
             msg_type = msg.get("type")
+            # One place, ahead of every handler, so a new one cannot forget to clear a pane's unread
+            # state (see SEEN_ON). Ahead of validation too: a client that named a known pane did
+            # look at it, whatever the rest of the message turns out to be.
+            if msg_type in SEEN_ON:
+                activity_note_seen(msg.get("pane_id", ""))
             if msg_type == "question_toggle":
                 pane_id = msg["pane_id"]
                 option = msg.get("option", "")
@@ -1266,10 +2097,12 @@ async def handle_client(ws):
                     await ws.send(json.dumps({"type": "error", "message": "invalid question option"}))
                     continue
                 remote = pane_remote_map.get(pane_id)
-                if not prompt_matches(pane_id, msg.get("prompt_id", ""), remote=remote):
+                if not await asyncio.to_thread(
+                    prompt_matches, pane_id, msg.get("prompt_id", ""), remote=remote
+                ):
                     await ws.send(json.dumps({"type": "error", "message": "question changed; refresh and try again"}))
                     continue
-                if not toggle_question_option(pane_id, option, remote=remote):
+                if not await asyncio.to_thread(toggle_question_option, pane_id, option, remote=remote):
                     await ws.send(json.dumps({"type": "error", "message": "question option toggle failed"}))
             elif msg_type == "question_submit":
                 pane_id = msg["pane_id"]
@@ -1277,10 +2110,12 @@ async def handle_client(ws):
                     await ws.send(json.dumps({"type": "error", "message": "unknown pane_id"}))
                     continue
                 remote = pane_remote_map.get(pane_id)
-                if not prompt_matches(pane_id, msg.get("prompt_id", ""), remote=remote):
+                if not await asyncio.to_thread(
+                    prompt_matches, pane_id, msg.get("prompt_id", ""), remote=remote
+                ):
                     await ws.send(json.dumps({"type": "error", "message": "question changed; refresh and try again"}))
                     continue
-                if not submit_multi_question(pane_id, remote=remote):
+                if not await asyncio.to_thread(submit_multi_question, pane_id, remote=remote):
                     await ws.send(json.dumps({"type": "error", "message": "question submission failed"}))
             elif msg_type == "respond":
                 pane_id = msg["pane_id"]
@@ -1300,20 +2135,43 @@ async def handle_client(ws):
                     await ws.send(json.dumps(command_error("response empty or too long")))
                     continue
                 remote = pane_remote_map.get(pane_id)
-                content = read_pane(pane_id, remote=remote)
+                if pane_id in shell_pane_map:
+                    # A shell pane has no question to detect, no approval options to match and no
+                    # harness to refuse a bad answer: the text IS a command and Enter runs it.
+                    # That is what HERDR_SHELL_PANES buys and why it is off by default. The
+                    # question guard below would refuse every one of these, so it is skipped
+                    # rather than tricked -- and the audit line says which kind of pane it was.
+                    log.info("Shell command from %s (%s): pane=%s text=%r", ip, device, pane_id, text)
+                    audit("respond_shell", ip, device, pane_id, f"text={text!r}")
+                    delivered = await asyncio.to_thread(
+                        _mutate_herdr, "pane", "send-text", pane_id, text, remote=remote
+                    ) and await asyncio.to_thread(
+                        _mutate_herdr, "pane", "send-keys", pane_id, "Enter", remote=remote
+                    )
+                    await ws.send(json.dumps(
+                        {"type": "command_result", "command": "respond", "ok": bool(delivered),
+                         **({"request_id": request_id} if request_id else {})}))
+                    continue
+                content = await asyncio.to_thread(read_pane, pane_id, remote=remote)
                 if question_prompt_id(pane_id, content) != msg.get("prompt_id", ""):
                     await ws.send(json.dumps(command_error("prompt changed; refresh and try again")))
                     continue
-                question = detect_question(content) if pane_is_omp(pane_id, remote=remote) else None
+                question = (
+                    detect_question(content)
+                    if await asyncio.to_thread(pane_is_omp, pane_id, remote=remote)
+                    else None
+                )
                 log.info("Response from %s (%s): pane=%s text=%r", ip, device, pane_id, text)
                 audit("respond", ip, device, pane_id, f"text={text!r}")
                 if question:
-                    delivered = respond_to_question(pane_id, text, question, remote=remote)
+                    delivered = await asyncio.to_thread(
+                        respond_to_question, pane_id, text, question, remote=remote
+                    )
                 elif custom_editor_active(content) or text.lower() in SAFE_RESPONSES:
-                    delivered = _mutate_herdr(
-                        "pane", "send-text", pane_id, text, remote=remote
-                    ) and _mutate_herdr(
-                        "pane", "send-keys", pane_id, "Enter", remote=remote
+                    delivered = await asyncio.to_thread(
+                        _mutate_herdr, "pane", "send-text", pane_id, text, remote=remote
+                    ) and await asyncio.to_thread(
+                        _mutate_herdr, "pane", "send-keys", pane_id, "Enter", remote=remote
                     )
                 else:
                     await ws.send(json.dumps({
@@ -1329,7 +2187,13 @@ async def handle_client(ws):
                 await ws.send(json.dumps(response))
             elif msg_type == "session_switch":
                 request_id = msg.get("request_id")
-                ok, err, changed = apply_session_switch(msg.get("host"), msg.get("session"), ip, device)
+                # The allowlist read is one `herdr session list` per call -- an ssh round trip
+                # for a remote -- so it goes to a worker thread. The mutation stays here: it
+                # drains an asyncio.Queue and bumps POLL_GENERATION, neither safe off the loop.
+                names = await asyncio.to_thread(session_switch_names, msg.get("host"))
+                ok, err, changed = apply_session_switch(
+                    msg.get("host"), msg.get("session"), ip, device, names=names
+                )
                 if not ok:
                     response = {"type": "error", "message": err}
                     if request_id:
@@ -1360,30 +2224,82 @@ async def handle_client(ws):
                 if pane_id not in known_panes:
                     await ws.send(json.dumps({"type": "error", "message": "unknown pane_id"}))
                     continue
-                lines = msg.get("lines", "30")
                 read_format = msg.get("format", "text")
                 if read_format not in {"text", "ansi"}:
                     await ws.send(json.dumps({"type": "error", "message": "invalid pane read format"}))
                     continue
+                # herdr clamps pane.read at ~1000 lines and does not say so (`truncated` stays
+                # true either way): 999/1000/1500/5000 all came back with the same 1000 rows.
+                # Asking for more only buys a bigger request, so refuse to pretend.
+                try:
+                    lines = max(1, min(int(msg.get("lines", 30)), MAX_READ_LINES))
+                except (TypeError, ValueError):
+                    await ws.send(json.dumps({"type": "error", "message": "invalid pane read lines"}))
+                    continue
+                # Clients pick the source: `visible` for a live mirror poll (free, viewport only),
+                # `recent`/`recent-unwrapped` when the user explicitly asks for scrollback. Note
+                # `recent` + text on an alt-screen agent pane is the multi-second harvest that
+                # scrolls the operator's terminal (see PROMPT_READ_SOURCE) -- it is allowed here
+                # because it is user-initiated, not because it is cheap.
+                read_source = str(msg.get("source", "recent")).replace("_", "-")
+                if read_source not in READ_SOURCES:
+                    await ws.send(json.dumps({"type": "error", "message": "invalid pane read source"}))
+                    continue
                 remote = pane_remote_map.get(pane_id)
-                content = run_herdr(
-                    "pane", "read", pane_id, "--lines", str(lines), "--source", "recent",
+                content = await asyncio.to_thread(
+                    run_herdr,
+                    "pane", "read", pane_id, "--lines", str(lines), "--source", read_source,
                     "--format", read_format, remote=remote
                 )
-                await ws.send(json.dumps({"type": "pane_content", "pane_id": pane_id, "content": content}))
+                reply = {"type": "pane_content", "pane_id": pane_id, "content": content}
+                if msg.get("process"):
+                    # One extra CLI call, so it is asked for rather than always sent: a client
+                    # wants it when it OPENS a pane, not on every mirror refresh.
+                    reply["process"] = await asyncio.to_thread(
+                        pane_process, pane_id, remote=remote
+                    )
+                await ws.send(json.dumps(reply))
             elif msg_type == "get_history":
                 pane_id = msg["pane_id"]
                 if pane_id not in known_panes:
                     await ws.send(json.dumps({"type": "error", "message": "unknown pane_id"}))
                     continue
-                agent = agent_cache.get(pane_id) or {}
-                messages = []
-                # ponytail: local Claude panes only. A remote pane's transcript
-                # lives on the remote host, and other agents do not write this
-                # format; both fall through to the client's empty state.
-                if not pane_remote_map.get(pane_id) and agent.get("agent") == "claude":
-                    messages = read_session_transcript(agent.get("cwd", ""))
-                await ws.send(json.dumps({"type": "history", "pane_id": pane_id, "messages": messages}))
+                # History comes from the agent's own transcript, not from the terminal: an agent
+                # TUI runs on the alternate screen, so herdr kept no scrollback for it, and the
+                # one read that does reach older rows costs ~31ms per line and scrolls the
+                # operator's terminal. What used to stand here called `herdr agent history`, a
+                # command that does not exist.
+                #
+                # The session uuid never crosses the wire in either direction: the client sends a
+                # pane_id, the relay looks the ref up in pane_session_map (which it populates from
+                # `pane list`), and transcript.history validates it before it touches a path.
+                try:
+                    limit = int(msg.get("limit", transcript.DEFAULT_LIMIT))
+                except (TypeError, ValueError):
+                    await ws.send(json.dumps({"type": "error", "message": "invalid history limit"}))
+                    continue
+                before = msg.get("before")
+                if before is not None and not isinstance(before, str):
+                    await ws.send(json.dumps({"type": "error", "message": "invalid history cursor"}))
+                    continue
+                remote = pane_remote_map.get(pane_id)
+                pane = agent_cache.get(pane_id) or {}
+                # Off the event loop: a cold read of the biggest transcript on this machine (33MB)
+                # measured 0.29s, and a remote one is an SSH round trip. Neighbouring handlers
+                # block the loop on their subprocess; this one is too slow to join them.
+                body = await asyncio.to_thread(
+                    transcript.history,
+                    pane_session_map.get(pane_id),
+                    remote=remote,
+                    limit=limit,
+                    before=before or None,
+                    include_tools=bool(msg.get("include_tools")),
+                    agent=pane.get("agent", ""),
+                    ssh_args=SSH_BASE_ARGS,
+                    remote_runner=transcript_ssh,
+                    log=log,
+                )
+                await ws.send(json.dumps({"type": "history", "pane_id": pane_id, **body}))
             elif msg_type == "send_keys":
                 pane_id = msg["pane_id"]
                 request_id = msg.get("request_id")
@@ -1398,25 +2314,59 @@ async def handle_client(ws):
                     await ws.send(json.dumps(command_error("unknown pane_id")))
                     continue
                 keys = msg.get("keys", [])
-                if not all(k in SAFE_KEYS for k in keys):
+                if not isinstance(keys, list) or not keys:
+                    log.warning("send_keys from %s (%s) has no key list: %.120r", ip, device, keys)
                     await ws.send(json.dumps(command_error("keys contain disallowed values")))
                     continue
+                refused = [key for key in keys if not key_is_allowed(key)]
+                if refused:
+                    # Logged because the refusal is otherwise INVISIBLE: this branch returns above
+                    # the `log.info` below, so a client sending a key this relay does not know
+                    # left no trace at all -- which is exactly the case that needs diagnosing,
+                    # since it is what a client newer than its relay looks like.
+                    log.warning("send_keys from %s (%s) refused for pane %s: %.120r",
+                                ip, device, pane_id, refused)
+                    detail = ", ".join(str(key)[:24] for key in refused[:4])
+                    await ws.send(json.dumps(
+                        command_error(f"keys contain disallowed values: {detail}")))
+                    continue
                 remote = pane_remote_map.get(pane_id)
-                content = read_pane(pane_id, remote=remote)
+                content = await asyncio.to_thread(read_pane, pane_id, remote=remote)
                 if detect_approval_options(content) and any(key.isdigit() for key in keys):
                     if question_prompt_id(pane_id, content) != msg.get("prompt_id", ""):
                         await ws.send(json.dumps(command_error("prompt changed; refresh and try again")))
                         continue
                 log.info("Keys from %s (%s): pane=%s keys=%s", ip, device, pane_id, keys)
                 audit("send_keys", ip, device, pane_id, f"keys={keys}")
-                try:
-                    result = run_herdr_result("pane", "send-keys", pane_id, *keys, remote=remote)
-                except Exception as exc:
-                    log.warning("send_keys command failed for pane %s: %s", pane_id, exc)
-                    await ws.send(json.dumps(command_error("send_keys command failed")))
-                    continue
-                if result.returncode != 0:
-                    log.warning("send_keys command failed for pane %s with exit %s", pane_id, result.returncode)
+                # Keys herdr's validator refuses (CSI_TILDE_KEYS / CSI_LETTER_KEYS) travel as raw
+                # CSI bytes through `pane send-text`. Consecutive keys of one kind go out in a
+                # single call, and the runs keep the order the client sent them -- a client that
+                # queues [Escape, PageUp, Enter] gets those three in that order, not regrouped.
+                runs = []
+                for key in keys:
+                    sequence = key_escape_sequence(key)
+                    kind = "send-text" if sequence else "send-keys"
+                    if runs and runs[-1][0] == kind:
+                        runs[-1][1].append(sequence or key)
+                    else:
+                        runs.append((kind, [sequence or key]))
+                failure = ""
+                for kind, payload in runs:
+                    # send-text takes ONE text argument, so a run of CSI keys is concatenated.
+                    args = ["".join(payload)] if kind == "send-text" else payload
+                    try:
+                        result = await asyncio.to_thread(
+                            run_herdr_result, "pane", kind, pane_id, *args, remote=remote
+                        )
+                    except Exception as exc:
+                        failure = f"raised {exc}"
+                    else:
+                        if result.returncode != 0:
+                            failure = f"exit {result.returncode}"
+                    if failure:
+                        log.warning("send_keys %s failed for pane %s: %s", kind, pane_id, failure)
+                        break
+                if failure:
                     await ws.send(json.dumps(command_error("send_keys command failed")))
                     continue
                 response = {"type": "command_result", "command": "send_keys", "ok": True}
@@ -1435,31 +2385,147 @@ async def handle_client(ws):
                 remote = pane_remote_map.get(pane_id)
                 log.info("Text from %s (%s): pane=%s text=%r", ip, device, pane_id, text)
                 audit("send_text", ip, device, pane_id, f"text={text!r}")
-                run_herdr("pane", "send-text", pane_id, text, remote=remote)
+                await asyncio.to_thread(run_herdr, "pane", "send-text", pane_id, text, remote=remote)
             elif msg_type == "agent_prompt":
                 # Use 'herdr agent prompt' for proper submission (works with Codex, Claude, etc.)
+                request_id = msg.get("request_id")
                 pane_id = msg["pane_id"]
                 if pane_id not in known_panes:
-                    await ws.send(json.dumps({"type": "error", "message": "unknown pane_id"}))
+                    response = {"type": "error", "message": "unknown pane_id"}
+                    if request_id:
+                        response["request_id"] = request_id
+                    await ws.send(json.dumps(response))
                     continue
                 text = msg.get("text", "")
                 if not text or len(text) > 10000:
-                    await ws.send(json.dumps({"type": "error", "message": "text empty or too long"}))
+                    response = {"type": "error", "message": "text empty or too long"}
+                    if request_id:
+                        response["request_id"] = request_id
+                    await ws.send(json.dumps(response))
                     continue
                 remote = pane_remote_map.get(pane_id)
                 log.info("Agent prompt from %s (%s): pane=%s text=%r", ip, device, pane_id, text[:100])
                 audit("agent_prompt", ip, device, pane_id, f"text={text[:100]!r}")
-                run_herdr("agent", "prompt", pane_id, text, remote=remote)
-                await ws.send(json.dumps({"type": "command_result", "command": "agent_prompt", "ok": True}))
+                await asyncio.to_thread(run_herdr, "agent", "prompt", pane_id, text, remote=remote)
+                response = {"type": "command_result", "command": "agent_prompt", "ok": True}
+                if request_id:
+                    response["request_id"] = request_id
+                await ws.send(json.dumps(response))
+            elif msg_type == "focus":
+                # Move herdr's own focus. Which id the client sent says what to focus, so there is
+                # no separate kind field: `agent focus` takes a pane, and herdr walks up to the
+                # tab and workspace holding it. (A non-agent pane has no such command -- `pane
+                # focus` only steps to a neighbour by direction -- so focusing a shell pane will
+                # mean tab focus plus a walk when those panes are listed at all.)
+                target_kind, ident = "", ""
+                for kind, field in (("pane", "pane_id"), ("tab", "tab_id"), ("workspace", "workspace_id")):
+                    if msg.get(field):
+                        target_kind, ident = kind, msg[field]
+                        break
+                if not target_kind:
+                    await ws.send(json.dumps({"type": "error", "message": "pane_id, tab_id or workspace_id required"}))
+                    continue
+                if target_kind == "pane":
+                    if ident not in known_panes:
+                        await ws.send(json.dumps({"type": "error", "message": "unknown pane_id"}))
+                        continue
+                    remote = pane_remote_map.get(ident)
+                    shell = shell_pane_map.get(ident)
+                    if shell is not None:
+                        log.info("Focus from %s (%s): shell pane=%s", ip, device, ident)
+                        audit("focus", ip, device, ident, f"shell pane={ident}")
+                        moved = await asyncio.to_thread(
+                            focus_shell_pane, ident, shell.get("tab_id", ""), remote=remote
+                        )
+                        mark_spaces_dirty()
+                        await ws.send(json.dumps(
+                            {"type": "command_result", "command": "focus", "ok": moved}))
+                        continue
+                    args = ("agent", "focus", ident)
+                else:
+                    ok, remote, error = resolve_space(target_kind, ident, msg.get("host", ""))
+                    if not ok:
+                        await ws.send(json.dumps({"type": "error", "message": error}))
+                        continue
+                    args = (target_kind, "focus", ident)
+                log.info("Focus from %s (%s): %s=%s", ip, device, target_kind, ident)
+                audit("focus", ip, device, ident if target_kind == "pane" else "", f"{target_kind}={ident}")
+                moved = await asyncio.to_thread(
+                    _mutate_herdr, *args, remote=remote
+                )
+                # Focus is the one mutation whose whole effect is in the hierarchy, so the next
+                # broadcast has to carry it rather than wait out the slow cadence.
+                mark_spaces_dirty()
+                await ws.send(json.dumps({"type": "command_result", "command": "focus", "ok": moved}))
             elif msg_type == "create_tab":
                 workspace_id = msg.get("workspace_id", "")
-                if workspace_id:
-                    log.info("Create tab from %s (%s): workspace=%s", ip, device, workspace_id)
-                    audit("create_tab", ip, device, "", f"workspace={workspace_id}")
-                    run_herdr("tab", "create", "--workspace", workspace_id, "--focus")
-                    await ws.send(json.dumps({"type": "tab_created", "ok": True}))
-                else:
-                    await ws.send(json.dumps({"type": "error", "message": "workspace_id required"}))
+                ok, remote, error = resolve_space("workspace", workspace_id, msg.get("host", ""))
+                if not ok:
+                    await ws.send(json.dumps({"type": "error", "message": error}))
+                    continue
+                label = clean_label(msg.get("label", ""))
+                log.info("Create tab from %s (%s): workspace=%s", ip, device, workspace_id)
+                audit("create_tab", ip, device, "", f"workspace={workspace_id}")
+                args = ["tab", "create", "--workspace", workspace_id, "--focus"]
+                if label:
+                    args += ["--label", label]
+                created = await asyncio.to_thread(
+                    _mutate_herdr, *args, remote=remote
+                )
+                mark_spaces_dirty()
+                await ws.send(json.dumps({"type": "tab_created", "ok": created}))
+            elif msg_type == "rename_tab":
+                tab_id = msg.get("tab_id", "")
+                ok, remote, error = resolve_space("tab", tab_id, msg.get("host", ""))
+                if not ok:
+                    await ws.send(json.dumps({"type": "error", "message": error}))
+                    continue
+                label = clean_label(msg.get("label", ""))
+                if not label:
+                    await ws.send(json.dumps({"type": "error", "message": f"label empty, leading dash, or over {MAX_LABEL_LEN} chars"}))
+                    continue
+                log.info("Rename tab from %s (%s): tab=%s label=%r", ip, device, tab_id, label)
+                audit("rename_tab", ip, device, "", f"tab={tab_id} label={label!r}")
+                renamed = await asyncio.to_thread(
+                    _mutate_herdr, "tab", "rename", tab_id, label, remote=remote
+                )
+                mark_spaces_dirty()
+                await ws.send(json.dumps({"type": "command_result", "command": "rename_tab", "ok": renamed}))
+            elif msg_type == "close_tab":
+                # Destructive, and the relay is the wrong place to second-guess it: closing a tab
+                # takes its panes with it. Clients confirm; this logs who asked.
+                tab_id = msg.get("tab_id", "")
+                ok, remote, error = resolve_space("tab", tab_id, msg.get("host", ""))
+                if not ok:
+                    await ws.send(json.dumps({"type": "error", "message": error}))
+                    continue
+                log.info("Close tab from %s (%s): tab=%s", ip, device, tab_id)
+                audit("close_tab", ip, device, "", f"tab={tab_id}")
+                closed = await asyncio.to_thread(
+                    _mutate_herdr, "tab", "close", tab_id, remote=remote
+                )
+                mark_spaces_dirty()
+                await ws.send(json.dumps({"type": "command_result", "command": "close_tab", "ok": closed}))
+            elif msg_type == "rename_agent":
+                # herdr's own label for the pane, which is what `agents` reports as `label` and
+                # what every client shows as the card title. Nothing is typed into the agent.
+                pane_id = msg.get("pane_id", "")
+                if pane_id not in known_panes:
+                    await ws.send(json.dumps({"type": "error", "message": "unknown pane_id"}))
+                    continue
+                label = clean_label(msg.get("label", ""))
+                clear = bool(msg.get("clear"))
+                if not label and not clear:
+                    await ws.send(json.dumps({"type": "error", "message": f"label empty, leading dash, or over {MAX_LABEL_LEN} chars"}))
+                    continue
+                remote = pane_remote_map.get(pane_id)
+                log.info("Rename agent from %s (%s): pane=%s label=%r", ip, device, pane_id, label)
+                audit("rename_agent", ip, device, pane_id, f"label={label!r}" if label else "clear")
+                args = ("agent", "rename", pane_id, "--clear") if clear else ("agent", "rename", pane_id, label)
+                renamed = await asyncio.to_thread(
+                    _mutate_herdr, *args, remote=remote
+                )
+                await ws.send(json.dumps({"type": "command_result", "command": "rename_agent", "ok": renamed}))
             elif msg_type == "push_subscribe":
                 sub = msg.get("subscription")
                 if sub and sub not in push_subscriptions:
@@ -1557,10 +2623,16 @@ async def main():
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        await flush_activity()
         if zc is not None:
             try:
                 if info is not None:
-                    zc.unregister_service(info)
+                    # unregister_service submits a coroutine to zeroconf's own loop and waits on
+                    # .result(). Called from this loop it deadlocks against itself until zeroconf
+                    # gives up at _LOADED_SYSTEM_TIMEOUT -- measured 10.4s of a shutdown that
+                    # should be instant, on every restart. register_service was already on its own
+                    # thread; the teardown beside it never was.
+                    await asyncio.to_thread(zc.unregister_service, info)
             finally:
                 zc.close()
 

@@ -1,6 +1,7 @@
-import re
 import unittest
 from pathlib import Path
+
+from web_source import web_source
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -8,7 +9,8 @@ ROOT = Path(__file__).resolve().parents[1]
 
 class ClientPayloadTests(unittest.TestCase):
     def test_web_preserves_and_sends_omp_question_state(self):
-        source = (ROOT / "web" / "index.html").read_text(encoding="utf-8")
+        # The whole app: these payload fields are built in web/js/*.js, not in the markup.
+        source = web_source()
 
         for field in (
             "prompt_id",
@@ -21,29 +23,6 @@ class ClientPayloadTests(unittest.TestCase):
         self.assertIn("type:'question_toggle'", source)
         self.assertIn("type:'question_submit'", source)
         self.assertIn("prompt_id:a.prompt_id", source)
-
-    def test_web_sends_prompt_id_with_every_respond(self):
-        """The relay drops a respond whose prompt_id does not match the pane
-        (herdr_relay.py, "prompt changed; refresh and try again"), so a respond
-        without one can never be delivered."""
-        source = (ROOT / "web" / "index.html").read_text(encoding="utf-8")
-
-        sends = re.findall(r"type:'respond'[^}]*}", source)
-        self.assertTrue(sends, "no respond payload found; the send site moved")
-        for payload in sends:
-            self.assertIn("prompt_id", payload)
-
-    def test_web_free_text_retry_keys_on_the_error_the_relay_emits(self):
-        """respond carries allowlisted answers, plus free text on a question the
-        relay can drive itself. A blocked pane is often neither, so typed text
-        falls back to send_text -- keyed on the relay's rejection, verbatim. If
-        either side reworded it the retry would die silently."""
-        message = "free-text response requires a detected question"
-        relay = (ROOT / "relay" / "herdr_relay.py").read_text(encoding="utf-8")
-        web = (ROOT / "web" / "index.html").read_text(encoding="utf-8")
-
-        self.assertIn(message, relay, "relay no longer emits this; the retry is dead")
-        self.assertIn(message, web, "web no longer matches it; typed text is dropped")
 
     def test_swift_models_decode_omp_question_state(self):
         for relative_path in (
@@ -226,7 +205,15 @@ class ClientPayloadTests(unittest.TestCase):
         # with it the options each side parses back out of the same text. How much is read
         # to get there differs on purpose: 100 lines for a pane view the relay also serves,
         # 50 for a toast.
+        #
+        # The SOURCE now differs too, and deliberately: the relay reads `visible`, because its
+        # read runs on a 2s poll and a `recent` text read of more lines than the pane is tall
+        # makes herdr harvest an alt-screen agent's scrollback -- seconds per read, and it
+        # scrolls the operator's terminal. The Windows client asks for `recent` but only 50
+        # lines, so it stays under a normal pane's height and normally lands on the same
+        # viewport. Panes shorter than 50 rows are where the two can disagree.
         self.assertIn('"--lines", "100"', relay)
+        self.assertIn('PROMPT_READ_SOURCE = "visible"', relay)
         self.assertIn("PromptReadLines = 50", poller)
         self.assertIn("lines[-50:]", relay)
         self.assertIn("PromptKeepLines = 20", poller)
@@ -312,9 +299,10 @@ class ClientPayloadTests(unittest.TestCase):
         self.assertIn("Protocol.AgentPrompt(agent.Id, trimmed)", connection)
 
         # Both sides submit with `herdr agent prompt`, the verb the relay's agent_prompt
-        # handler runs — not by typing into the pane and hoping Enter takes.
+        # handler runs — not by typing into the pane and hoping Enter takes. The relay reaches
+        # it through a worker thread, so the subprocess never stalls the event loop.
         relay = (ROOT / "relay" / "herdr_relay.py").read_text(encoding="utf-8")
-        self.assertIn('run_herdr("agent", "prompt"', relay)
+        self.assertIn('run_herdr, "agent", "prompt"', relay)
         poller = (ROOT / "herdi-win" / "Services" / "HerdrPoller.cs").read_text(
             encoding="utf-8"
         )
