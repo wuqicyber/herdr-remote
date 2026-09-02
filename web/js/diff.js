@@ -31,6 +31,16 @@ function handleMessage(msg) {
     return;
   }
   if (msg.type === 'error') {
+    // respond delivers allowlisted answers, plus free text on a pane whose question the relay can
+    // drive itself. Where it can do neither, type into the pane instead: send_text has no
+    // allowlist of its own, so the only thing given up is the staleness check respond just
+    // performed. No Enter afterwards -- a blocked pane may be a multi-select, where Enter toggles
+    // the row under the cursor instead of submitting.
+    if (pendingFreeText && msg.message === 'free-text response requires a detected question') {
+      ws.send(JSON.stringify({type:'send_text', pane_id:pendingFreeText.pane_id, text:pendingFreeText.text}));
+      setTimeout(refreshPane, 500);
+    }
+    pendingFreeText = null;
     // A rejected session_switch must not leave the UI stuck on
     // "switching…" forever. Minimum handling only: no toast UI, since
     // nothing else in this file renders errors.

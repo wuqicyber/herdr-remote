@@ -814,6 +814,10 @@ function setupLongPress(el, type, id, name) {
   el.addEventListener('contextmenu', (e) => showContextMenu(e, type, id, name));
 }
 
+// Text sent through respond, kept until the relay accepts or rejects it so a rejection can be
+// retried on the channel that can carry it. See the error branch of handleMessage.
+let pendingFreeText = null;
+
 function sendText() {
   if(imeComposing)return;
   const i=document.getElementById('termInput');
@@ -828,6 +832,7 @@ function sendText() {
     return;
   }
   if(agent&&agent.status==='blocked') {
+    pendingFreeText={pane_id:activePane,text:i.value};
     ws.send(JSON.stringify({type:'respond',pane_id:activePane,prompt_id:agent.prompt_id,text:i.value}));
   } else {
     ws.send(JSON.stringify({type:'send_text',pane_id:activePane,text:i.value}));

@@ -147,7 +147,18 @@ function pressCtrl(label) {
 
 function toggleArrows(){}
 function hideArrows(){}
-function respond(t){if(!ws||!activePane)return;if(window.cue)cue('success');ws.send(JSON.stringify({type:'respond',pane_id:activePane,text:t}));document.getElementById('quickActions').innerHTML='';setTimeout(refreshPane,500);}
+function respond(t){
+  if(!ws||!activePane)return;
+  if(window.cue)cue('success');
+  // The relay drops a respond whose prompt_id does not match what the pane is showing -- and a
+  // missing one never matches, since question_prompt_id hashes the screen even when it detects no
+  // question. Send the one that arrived with the blocked message, as sendText() already does.
+  const agent=agents.find(a=>a.pane_id===activePane);
+  pendingFreeText=null;   // an option button is not the typed text
+  ws.send(JSON.stringify({type:'respond',pane_id:activePane,prompt_id:agent?.prompt_id,text:t}));
+  document.getElementById('quickActions').innerHTML='';
+  setTimeout(refreshPane,500);
+}
 let imeComposing = false, imeEndedAt = 0;
 {
   const ti = document.getElementById('termInput');
