@@ -1,0 +1,101 @@
+.github/scripts/check-versions.py
+  s_77c0d0df9dc385::t_153622fae73ba7 1-2,4-16,20,23-59,62-72,74-86,88-91,93-97,99-105,107-113,115-116,120
+.github/workflows/release.yml
+  s_77c0d0df9dc385::t_f0bece37624e62 1-133
+CLAUDE.md
+  s_77c0d0df9dc385::t_faaf0368ba7573 25-38,44,47,93,97-103,110-511,517-674,679-680,682-794
+README.md
+  s_77c0d0df9dc385::t_9cfde17c49b4bb 24
+SECURITY.md
+  s_77c0d0df9dc385::t_ed81bdc2e67313 41-76
+demo-worker/src/index.js
+  s_77c0d0df9dc385::t_1ceca93c417241 29-61,95-102
+herdi-mac/Sources/RelayConnection.swift
+  s_77c0d0df9dc385::t_a1adc9011ada99 221-226,229,231
+herdi-mac/build.sh
+  s_77c0d0df9dc385::t_fa28c0fff09887 7
+herdi-win/Herdi.Win.csproj
+  s_77c0d0df9dc385::t_853ae5907f29a8 20-22
+herdi-win/Services/HerdrPoller.cs
+  s_77c0d0df9dc385::t_17da2446b9e04b 238-244,257-263,267
+herdi-win/build.ps1
+  s_77c0d0df9dc385::t_22844eacb2f668 52
+herdr-plugin.toml
+  s_77c0d0df9dc385::t_1154975056f2e0 3
+relay/herdr-plugin.toml
+  s_77c0d0df9dc385::t_05958a65664836 3
+relay/herdr_relay.py
+  s_77c0d0df9dc385::t_b7d340e574a006 7,31-42,76-86,131-148,174-195,199-202,204-207,209-214,225-333,419-421,477-626,633-638,641,646,656-658,660-665,669-684,687-724,728-737,740,745,755-769,803-879,887,889-934,936-1047,1049-1056,1085-1091,1093-1098,1104-1111,1117-1121,1123,1127-1130,1176-1191,1194-1199,1205-1206,1213,1224,1259-1262,1275-1283,1286-1290,1292,1294-1316,1318,1320-1324,1326-1440,1444,1710-1717,1721,1746-1747,1749-1751,1757,1809,1822-1823,1833,1859-1913,1919,1922-1926,2032-2041,2088-2092,2100-2102,2105,2113-2115,2118,2138-2155,2159-2163,2167-2169,2171-2174,2190-2196,2231-2247,2249-2251,2254-2261,2267-2302,2317-2318,2321-2332,2334,2341-2369,2388,2391,2394-2397,2401-2404,2409-2459,2462-2528,2626,2630-2635
+relay/transcript.py
+  s_77c0d0df9dc385::t_012625b7a803b7 1-856
+tests/run.sh
+  s_77c0d0df9dc385::t_3fc696642e3c8d 74-75,77-80,85,89-91,95-111,113
+tests/test_ansi_terminal.py
+  s_77c0d0df9dc385::t_eae73961eac690 11-12,103-105,110-115
+tests/test_client_payloads.py
+  s_77c0d0df9dc385::t_6753d244d5b1a4 4-5,12-13,208-214,216,302-303,305
+tests/test_herdr_relay.py
+  s_77c0d0df9dc385::t_a6223c91ab0f1a 1,13,48-49,72-73,83,189-421,732,759,781,812,854,857-858,869,871-872,887-890,895,900,913-915,920-921,934-935,945-946,948-952,954,961,964,979,982-983,994,996-997,1002-1003,1010-1047,1117-1118,1132-1133,1138-1139,1167-1168,1175-1176,1206-1207,1214-1215,1287-1290,1598-1803,1898,1914-1920,1924,1955-1993,2054-2056,2093-2094,2096-2126,2128-2217,2219-2220,2223-2239,2241-2251,2253-2254,2258-2333,2335-2338,2341-2350,2352-2386,2388-2562,2564-2567,2569-2881
+tests/test_transcript.py
+  s_77c0d0df9dc385::t_a3391b1a3acf01 1-713
+tests/test_web_assets.py
+  s_77c0d0df9dc385::t_a0e5ad3cff894c 1-142
+tests/test_web_history.py
+  s_77c0d0df9dc385::t_e75d2556aa7950 1-485
+tests/test_web_keys.py
+  s_77c0d0df9dc385::t_bdd8f8ec50f6b8 1-546
+tests/test_web_pwa.py
+  s_77c0d0df9dc385::t_2251dfbb50c9a0 1-201
+tests/test_web_selection.py
+  s_77c0d0df9dc385::t_f68e0326f2c0c9 1-673
+tests/test_web_shell.py
+  s_77c0d0df9dc385::t_8ba9edd79afe72 1-373
+tests/test_web_spaces.py
+  s_77c0d0df9dc385::t_dba7d9dc750d21 1-956
+tests/test_web_theme.py
+  s_77c0d0df9dc385::t_69ae524f77ffb2 1-270
+tests/web_source.py
+  s_77c0d0df9dc385::t_40d33b24aa4017 1-30
+web/app.css
+  s_77c0d0df9dc385::t_f3326c0474f75b 1-456
+web/index.html
+  s_77c0d0df9dc385::t_bfaa6cac1e383b 5,8-25,32,52-60,101-115,118-126,128,140,142-144,149-153,157-169,171,174,184-190,203,208,213-222
+web/js/cards.js
+  s_77c0d0df9dc385::t_59f65b6fb476d9 1-415
+web/js/diff.js
+  s_77c0d0df9dc385::t_37828df82c295a 1-195
+web/js/markdown.js
+  s_77c0d0df9dc385::t_458e95e36f2707 1-198
+web/js/mirror.js
+  s_77c0d0df9dc385::t_b5d90ca890df87 1-840
+web/js/nav.js
+  s_77c0d0df9dc385::t_2a525751771a17 1-185
+web/js/palette.js
+  s_77c0d0df9dc385::t_a9e67ee494ca1c 1-87
+web/js/push.js
+  s_77c0d0df9dc385::t_0fd85f16e51a25 1-77
+web/js/spaces.js
+  s_77c0d0df9dc385::t_c71cf741e03359 1-361
+web/js/state.js
+  s_77c0d0df9dc385::t_0e70d6c2f7d747 1-381
+web/js/triage.js
+  s_77c0d0df9dc385::t_05aa32df597030 1-89
+web/sw.js
+  s_77c0d0df9dc385::t_c2607b6ee21a8a 22-25
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.24",
+  "base_commit_sha": "761f7d1741b8c8533f5f54e52361f06f96b9e3c1",
+  "prompts": {},
+  "sessions": {
+    "s_77c0d0df9dc385": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "13d6b635-af04-405c-870d-78c54ac6987e",
+        "model": "claude-opus-5"
+      },
+      "human_author": "eleanor.zhu <eleanore.zhu@gmail.com>"
+    }
+  }
+}
