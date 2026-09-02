@@ -56,8 +56,11 @@
 *:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; border-radius: 4px; }
 /* Painted as well as body: with viewport-fit=cover the UA canvas behind body is
    visible in the insets, and an unpainted one shows the light default. */
-html { background: var(--bg); }
-body { font-family: var(--font-mono); background: var(--bg); color: var(--text); min-height: 100dvh; min-height: -webkit-fill-available; display: flex; flex-direction: column; width: 100%; overflow-x: hidden; padding: 0 env(safe-area-inset-right, 0px) env(safe-area-inset-bottom, 0px) env(safe-area-inset-left, 0px); }
+/* The page itself never pans sideways. overflow-x on <body> alone does not stop it: the viewport
+   scroller is <html>, and overscroll-behavior keeps a swipe inside .chip-strip or .term-content
+   from rubber-banding the whole document. */
+html { background: var(--bg); overflow-x: hidden; overscroll-behavior: none; }
+body { font-family: var(--font-mono); background: var(--bg); color: var(--text); min-height: 100dvh; min-height: -webkit-fill-available; display: flex; flex-direction: column; width: 100%; overflow-x: hidden; overscroll-behavior: none; padding: 0 env(safe-area-inset-right, 0px) env(safe-area-inset-bottom, 0px) env(safe-area-inset-left, 0px); }
 
 .header { height: calc(var(--header-h) + env(safe-area-inset-top, 0px)); padding: env(safe-area-inset-top, 0px) 14px 0; display: flex; align-items: center; gap: 10px; border-bottom: 1px solid var(--border); flex-shrink: 0; position: relative; }
 .header h1 { font-size: 1rem; font-weight: 700; letter-spacing: -0.02em; }
@@ -82,8 +85,12 @@ body { font-family: var(--font-mono); background: var(--bg); color: var(--text);
 .settings h2 { font-size: 0.9rem; margin-bottom: 12px; }
 .setting-group { background: var(--surface); border-radius: 10px; padding: 12px; margin-bottom: 12px; }
 .setting-group label { font-size: 0.75rem; color: var(--muted); display: block; margin-bottom: 6px; }
-.setting-group input { width: 100%; padding: 8px; border-radius: 6px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size: 13px; }
-.setting-group select { width: 100%; padding: 8px; border-radius: 6px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size: 13px; }
+/* 16px is a floor on every focusable field (here, .hist-find, .term-search, .term-input and the
+   inline #cmdSearch), not a design choice: iOS Safari zooms the page whenever a focused control
+   is smaller, does not zoom back out on blur, and the zoom pans the fixed panes out from under
+   the viewport. tests/test_web_fields.py fails on anything lower. */
+.setting-group input { width: 100%; padding: 8px; border-radius: 6px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size: 16px; }
+.setting-group select { width: 100%; padding: 8px; border-radius: 6px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size: 16px; }
 .setting-group .hint { font-size: 0.65rem; color: var(--muted); margin-top: 4px; }
 .setting-group button { margin-top: 8px; padding: 8px 16px; border-radius: 6px; border: none; background: var(--green); color: var(--on-accent); font-weight: 600; font-size: 13px; cursor: pointer; }
 /* Appearance: one row, three exclusive choices, so a `radiogroup` rather than three `aria-pressed`
@@ -249,7 +256,7 @@ body { font-family: var(--font-mono); background: var(--bg); color: var(--text);
 .term-history .hist-toggle[aria-pressed="true"] { background: var(--blue); border-color: var(--blue); color: var(--on-accent); }
 /* Same 22px as the chips beside it: the row's height is set by its tallest child, so an input
    even two pixels taller than a chip would make the header jump every time the filter opened. */
-.term-history .hist-find { flex: 1; min-width: 0; height: 22px; padding: 0 8px; border-radius: 6px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size: 0.75rem; }
+.term-history .hist-find { flex: 1; min-width: 0; height: 22px; padding: 0 8px; border-radius: 6px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size: 16px; }
 .term-history .hist-find:focus { outline: none; border-color: var(--blue); }
 .term-history .hist-count { font-size: 0.65rem; color: var(--muted); white-space: nowrap; font-variant-numeric: tabular-nums; }
 /* `overscroll-behavior: contain`, for the same reason `.term-content` carries it: at the top of the
@@ -330,7 +337,7 @@ body { font-family: var(--font-mono); background: var(--bg); color: var(--text);
 .term-history .diff-line.gap::before { content: none; }
 .term-history .diff-edge { font-size: 0.65rem; color: var(--orange); margin: -4px 0 8px 14px; }
 .term-search { display: flex; align-items: center; gap: 6px; padding: 8px 12px; background: var(--surface); border-bottom: 1px solid var(--border); }
-.term-search input { flex: 1; padding: 6px 10px; border-radius: 6px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size: 0.85rem; }
+.term-search input { flex: 1; padding: 6px 10px; border-radius: 6px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size: 16px; }
 .term-search input:focus { outline: none; border-color: var(--blue); }
 .term-search span { font-size: 0.7rem; color: var(--muted); min-width: 40px; text-align: center; }
 .term-search button { background: none; border: none; color: var(--muted); cursor: pointer; padding: 4px; }
@@ -351,7 +358,7 @@ body { font-family: var(--font-mono); background: var(--bg); color: var(--text);
 .quick-actions button { padding: 8px 12px; border-radius: 8px; border: none; font-size: 0.8rem; font-weight: 600; cursor: pointer; flex: 1; min-width: 70px; display: flex; align-items: center; justify-content: center; gap: 6px; }
 .btn-yes { background: var(--green); color: var(--on-accent); } .btn-trust { background: var(--blue); color: var(--on-accent); } .btn-no { background: var(--red); color: var(--on-accent); }
 .term-input { border-top: 1px solid var(--border); padding: 5px 10px; display: flex; gap: 5px; background: var(--surface); flex-shrink: 0; }
-.term-input input { flex: 1; padding: 7px 9px; border-radius: 6px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size: 14px; font-family: var(--font-term); min-width: 0; }
+.term-input input { flex: 1; padding: 7px 9px; border-radius: 6px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size: 16px; font-family: var(--font-term); min-width: 0; }
 .term-cmd { padding: 6px 11px; border-radius: 6px; border: 1px solid var(--blue); background: var(--bg); color: var(--blue); font-weight: 700; font-size: 14px; flex-shrink: 0; cursor: pointer; }
 .term-send { padding: 6px 13px; border-radius: 6px; border: none; background: var(--blue); color: var(--on-accent); flex-shrink: 0; cursor: pointer; display: flex; align-items: center; }
 /* The keys and quick-action docks are toggles too, and they were the worst of the set: pixel
