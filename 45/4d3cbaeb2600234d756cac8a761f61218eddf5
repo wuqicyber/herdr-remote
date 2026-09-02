@@ -1,0 +1,19 @@
+web/app.css
+  s_77c0d0df9dc385::t_7e26eb57f36c89 185-192,457-459
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.24",
+  "base_commit_sha": "454d3cbaeb2600234d756cac8a761f61218eddf5",
+  "prompts": {},
+  "sessions": {
+    "s_77c0d0df9dc385": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "13d6b635-af04-405c-870d-78c54ac6987e",
+        "model": "unknown"
+      },
+      "human_author": "eleanor.zhu <eleanore.zhu@gmail.com>"
+    }
+  }
+}
