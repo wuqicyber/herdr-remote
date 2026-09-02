@@ -1,0 +1,27 @@
+tests/test_client_payloads.py
+  s_77c0d0df9dc385::t_9e8d6891abf882 27-31
+tests/test_web_respond.py
+  s_77c0d0df9dc385::t_59b572b32b13f0 1-108
+web/js/diff.js
+  s_77c0d0df9dc385::t_3cfaf3cb97f716 34-43
+web/js/mirror.js
+  s_77c0d0df9dc385::t_b81a7a4a3ff63c 817-820,835
+web/js/nav.js
+  s_77c0d0df9dc385::t_c6b47a5cd5db08 150-161
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.24",
+  "base_commit_sha": "7fadf5cfb802355f7e4f94586c23016efd9d7351",
+  "prompts": {},
+  "sessions": {
+    "s_77c0d0df9dc385": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "13d6b635-af04-405c-870d-78c54ac6987e",
+        "model": "unknown"
+      },
+      "human_author": "eleanor.zhu <eleanore.zhu@gmail.com>"
+    }
+  }
+}
