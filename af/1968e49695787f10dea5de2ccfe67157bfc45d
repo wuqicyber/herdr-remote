@@ -1,0 +1,23 @@
+web/index.html
+  s_77c0d0df9dc385::t_d50d14f06b7e78 208
+tests/test_web_fields.py
+  s_77c0d0df9dc385::t_e702052d977834 1-54
+web/app.css
+  s_77c0d0df9dc385::t_19c3a5f696921f 59-63,88-93,259,340,361
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.24",
+  "base_commit_sha": "af1968e49695787f10dea5de2ccfe67157bfc45d",
+  "prompts": {},
+  "sessions": {
+    "s_77c0d0df9dc385": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "13d6b635-af04-405c-870d-78c54ac6987e",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "eleanor.zhu <eleanore.zhu@gmail.com>"
+    }
+  }
+}
