@@ -44,10 +44,15 @@ class FieldTests(unittest.TestCase):
         self.assertGreaterEqual(float(inline.group(1)), 16)
 
     def test_page_itself_never_pans_sideways(self):
-        html = rule_body(self.page, "html")
-        self.assertIn("overflow-x: hidden", html)
-        self.assertIn("overscroll-behavior: none", html)
+        self.assertIn("overflow-x: hidden", rule_body(self.page, "body"))
         self.assertIn("overscroll-behavior: none", rule_body(self.page, "body"))
+
+    def test_the_root_element_is_never_made_a_scroll_container(self):
+        """`overflow` on <html> stops the property propagating to the viewport and makes the root
+        a scroller instead. On iOS that changes what a fixed box is laid out against, and the
+        session view stops short of the bottom of the screen. Whatever the sideways-pan fix is,
+        it is not this."""
+        self.assertNotRegex(rule_body(self.page, "html"), r"overflow")
 
 
 if __name__ == "__main__":

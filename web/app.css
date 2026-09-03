@@ -56,10 +56,11 @@
 *:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; border-radius: 4px; }
 /* Painted as well as body: with viewport-fit=cover the UA canvas behind body is
    visible in the insets, and an unpainted one shows the light default. */
-/* The page itself never pans sideways. overflow-x on <body> alone does not stop it: the viewport
-   scroller is <html>, and overscroll-behavior keeps a swipe inside .chip-strip or .term-content
-   from rubber-banding the whole document. */
-html { background: var(--bg); overflow-x: hidden; overscroll-behavior: none; }
+/* No `overflow` here, deliberately. Setting any of it on the root makes <html> a scroll container
+   rather than letting the property propagate to the viewport, and on iOS that moves what a fixed
+   box is laid out against -- the session view then stops short of the screen and html's own
+   background shows underneath. Sideways panning is a real problem, but it belongs on <body>. */
+html { background: var(--bg); }
 body { font-family: var(--font-mono); background: var(--bg); color: var(--text); min-height: 100dvh; min-height: -webkit-fill-available; display: flex; flex-direction: column; width: 100%; overflow-x: hidden; overscroll-behavior: none; padding: 0 env(safe-area-inset-right, 0px) env(safe-area-inset-bottom, 0px) env(safe-area-inset-left, 0px); }
 
 .header { height: calc(var(--header-h) + env(safe-area-inset-top, 0px)); padding: env(safe-area-inset-top, 0px) 14px 0; display: flex; align-items: center; gap: 10px; border-bottom: 1px solid var(--border); flex-shrink: 0; position: relative; }
