@@ -436,9 +436,16 @@ body { font-family: var(--font-mono); background: var(--bg); color: var(--text);
 @media (min-width: 768px) {
   body { max-width: 960px; margin: 0 auto; padding: 0 16px; }
   /* relative, not static: the history panel is absolutely positioned, and a static parent sent it
-     to the viewport instead -- full-bleed and over the app header. */
-  .terminal-view { position: relative; display: none; }
-  .terminal-view.active { display: flex; height: calc(100dvh - 49px); }
+     to the viewport instead -- full-bleed and over the app header.
+     `top` has to go with the fixed positioning it was written for. Under `relative` it does not
+     place the box, it OFFSETS it: the header's height was subtracted from the viewport twice, once
+     as the empty band the box left behind in the flow and once as the same distance pushed off the
+     bottom, which is where the desktop scrollbar came from. */
+  .terminal-view { position: relative; display: none; top: auto; }
+  /* The 49px this used to subtract was a header measurement that stopped being true. Ask the
+     header itself -- it is one custom property, and .term-history's own offset is the only other
+     place in this file still carrying a number of its own. */
+  .terminal-view.active { display: flex; height: calc(100dvh - var(--header-h)); }
   .agents { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 12px; }
   .section-header { grid-column: 1 / -1; }
   .tab-heading, .empty-tab { grid-column: 1 / -1; }
