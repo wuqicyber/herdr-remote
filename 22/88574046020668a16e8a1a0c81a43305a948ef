@@ -1,0 +1,21 @@
+tests/test_web_fields.py
+  s_77c0d0df9dc385::t_c0eb9de2ed0200 47,50-56
+web/app.css
+  s_77c0d0df9dc385::t_9d25f1a429c863 59-63
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.24",
+  "base_commit_sha": "2288574046020668a16e8a1a0c81a43305a948ef",
+  "prompts": {},
+  "sessions": {
+    "s_77c0d0df9dc385": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "13d6b635-af04-405c-870d-78c54ac6987e",
+        "model": "unknown"
+      },
+      "human_author": "eleanor.zhu <eleanore.zhu@gmail.com>"
+    }
+  }
+}
