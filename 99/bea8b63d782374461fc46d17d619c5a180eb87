@@ -1,0 +1,21 @@
+tests/test_web_pwa.py
+  s_77c0d0df9dc385::t_09a8d31830db5d 121-122,127-138
+web/index.html
+  s_77c0d0df9dc385::t_b78aa3e8ac6a98 7-14
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.24",
+  "base_commit_sha": "99bea8b63d782374461fc46d17d619c5a180eb87",
+  "prompts": {},
+  "sessions": {
+    "s_77c0d0df9dc385": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "13d6b635-af04-405c-870d-78c54ac6987e",
+        "model": "unknown"
+      },
+      "human_author": "eleanor.zhu <eleanore.zhu@gmail.com>"
+    }
+  }
+}
