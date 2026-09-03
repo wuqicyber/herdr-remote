@@ -9,3 +9,4 @@ __pycache__/
 .swiftpm/
 .venv/
 .wrangler/
+.idea/
