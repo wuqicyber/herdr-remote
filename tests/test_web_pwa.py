@@ -118,10 +118,23 @@ class InstalledChromeTests(unittest.TestCase):
         self.assertNotEqual(light.lower(), dark.lower(), "two identical values follow nothing")
 
     def test_the_page_fills_the_display_it_asked_to_own(self):
-        """black-translucent without viewport-fit=cover is where the white iOS edges came from."""
+        """Without viewport-fit=cover the page is laid inside the insets and the iOS edges go
+        white. It is still wanted for the bottom and the sides with a `default` status bar."""
         viewport = re.search(r'<meta name="viewport" content="([^"]+)"', INDEX)
         self.assertIsNotNone(viewport)
         self.assertIn("viewport-fit=cover", viewport.group(1))
+
+    def test_the_status_bar_does_not_ask_to_be_drawn_under(self):
+        """`black-translucent` applies from the home screen and nowhere else. It puts the page
+        under the status bar, which makes env(safe-area-inset-top) 59px where Safari reports 0,
+        and WebKit then lays a fixed box out against a viewport short by exactly that while
+        painting the full screen: .terminal-view stopped 59px above the bottom of the display and
+        html's background showed through, from the home screen only. The header is a solid bar,
+        so drawing under the status bar bought nothing to pay for that."""
+        style = re.search(
+            r'<meta name="apple-mobile-web-app-status-bar-style" content="([^"]+)"', INDEX)
+        self.assertIsNotNone(style, "the status bar style meta is gone")
+        self.assertNotEqual(style.group(1), "black-translucent")
 
     def test_the_ua_canvas_is_told_which_scheme_it_is_in(self):
         """Without color-scheme the UA paints scrollbars and controls light under a dark page."""

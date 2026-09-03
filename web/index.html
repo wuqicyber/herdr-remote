@@ -4,7 +4,14 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
 <meta name="apple-mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<!-- `default`, not `black-translucent`. Translucent takes effect only from the home screen, where
+     it puts the page under the status bar and makes env(safe-area-inset-top) 59px instead of the
+     0 it is in Safari. WebKit then lays a fixed box out against a viewport short by exactly that
+     much while painting the full screen, so .terminal-view ended 59px above the bottom and html's
+     background showed through -- from the home screen only, which is why Safari looked fine.
+     The status bar sits on the header's own colour now, and the header is a solid bar either
+     way, so the full-bleed this bought was never visible. -->
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
 <meta name="theme-color" content="#f5f5f5" media="(prefers-color-scheme: light)">
 <meta name="theme-color" content="#0a0a0a" media="(prefers-color-scheme: dark)">
 <!-- The pin, before anything paints: someone who chose Dark must not be shown the OS's Light
