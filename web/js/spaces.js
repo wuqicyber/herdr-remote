@@ -72,8 +72,38 @@ function render() {
   // Checked here rather than at the top of render(), so the name maps and the sibling strips still
   // track the truth while the list itself holds still.
   if (selectionInside(list)) return;
+  const strips = chipStripScroll(list);
   list.innerHTML = activeWorkspace ? renderSpaceView(rows) : renderHerd(rows, occupied);
+  restoreChipStripScroll(list, strips);
   bindLongPressHandlers();
+}
+
+// A rebuild is not a gesture, and this list rebuilds on every `agents` snapshot -- every two
+// seconds, forever. The chip strips scroll SIDEWAYS (ten spaces do not fit across a phone), and
+// `innerHTML` throws away the very elements that hold the offset, so a reader who had scrolled the
+// Spaces row to reach the space at the far end watched it snap back to the beginning mid-reach.
+// That is the reported bug, and it is the same one the sibling row has (see renderSiblings): the
+// offset is the reader's, so it survives a rebuild it did not ask for.
+//
+// Keyed by WHAT the strip is (`data-strip`), not by its position in the list: the herd draws one
+// strip and the space view draws two, and the Spaces row has to keep its place across that switch
+// as well -- picking a space is exactly when you have just scrolled it.
+function chipStripScroll(list) {
+  const kept = new Map();
+  for (const strip of list.querySelectorAll('.chip-strip')) {
+    if (strip.scrollLeft) kept.set(strip.dataset.strip, strip.scrollLeft);
+  }
+  return kept;
+}
+
+function restoreChipStripScroll(list, kept) {
+  if (!kept.size) return;
+  for (const strip of list.querySelectorAll('.chip-strip')) {
+    const x = kept.get(strip.dataset.strip);
+    // Assigned, not clamped by hand: a strip that lost chips since the last snapshot is put at its
+    // own new end by the browser rather than left pointing past it.
+    if (x) strip.scrollLeft = x;
+  }
 }
 
 // The herd, in the one order the app agrees on. AGENTS only: two thirds of the panes on a real host
@@ -146,29 +176,32 @@ function tabHeading(g) {
 
 /** A workspace's panes by tab, in tab order, including empty tabs. Panes whose tab is not in the
  *  tab list yet -- a brief poll race after a create -- fall into a trailing group so they are never
- *  lost -- the list is the panes, and the hierarchy only names and orders them. */
+ *  lost -- the list is the panes, and the hierarchy only names and orders them.
+ *
+ *  Through panesInSpace, so this view and the session strip put two panes of one tab in the same
+ *  order: herdr's own. Merging the two arrays here, which is what this did, put every agent ahead of
+ *  every terminal -- so a terminal split between two agents was drawn last, in a view whose whole
+ *  claim is that it shows what is in a tab. */
 function groupPanesByTab(workspaceKey) {
-  const panes = [], seen = new Set();
-  for (const p of [...agents, ...shellPanes]) {
-    // By pane_id: the two arrays are disjoint in a snapshot, but a `blocked` push can add an agent
-    // record for a pane still sitting in shellPanes.
-    if (seen.has(p.pane_id) || agentWorkspaceKey(p) !== workspaceKey) continue;
-    seen.add(p.pane_id);
-    panes.push(p);
-  }
+  const panes = panesInSpace(workspaceKey);
   const tabs = tabRows(workspaceKey);
   const groups = tabs.map(t => ({
-    key: t.key, name: t.name, focused: t.focused,
+    // `id` is the bare tab id the relay wants, `key` the host-qualified one this page compares on.
+    // The session strip needs both: it marks the group holding the open pane by key and puts the id
+    // on the chip.
+    key: t.key, id: t.id, name: t.name, focused: t.focused,
     panes: panes.filter(p => agentTabKey(p) === t.key),
   }));
   const known = new Set(tabs.map(t => t.key));
   const orphans = panes.filter(p => !known.has(agentTabKey(p)));
-  if (orphans.length) groups.push({key: `${workspaceKey}|other`, name: '…', panes: orphans});
+  if (orphans.length) {
+    groups.push({key: `${workspaceKey}|other`, id: '', name: '…', panes: orphans});
+  }
   return groups;
 }
 
 function spaceStrip(rows) {
-  let html = `<div class="chip-strip"><span class="chip-label">Spaces</span>`;
+  let html = `<div class="chip-strip" data-strip="spaces"><span class="chip-label">Spaces</span>`;
   html += `<button class="chip${activeWorkspace === null ? ' active' : ''}" onclick="backToWorkspaces()">All</button>`;
   for (const w of rows) {
     const held = [...agents, ...shellPanes].filter(p => agentWorkspaceKey(p) === w.key);
@@ -189,7 +222,7 @@ function spaceStrip(rows) {
 
 function tabStrip(rows) {
   const wsTabs = tabRows(activeWorkspace);
-  let html = `<div class="chip-strip"><span class="chip-label">Tabs</span>`;
+  let html = `<div class="chip-strip" data-strip="tabs"><span class="chip-label">Tabs</span>`;
   if (wsTabs.length > 1) {
     html += `<button class="chip${!activeTab ? ' active' : ''}" onclick="selectTab(null)">All</button>`;
   }
