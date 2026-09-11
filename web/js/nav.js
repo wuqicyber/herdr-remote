@@ -147,15 +147,16 @@ function pressCtrl(label) {
 
 function toggleArrows(){}
 function hideArrows(){}
-function respond(t){
+// The relay refuses any respond whose prompt_id does not match what is on the pane right now
+// (herdr_relay.py, "prompt changed; refresh and try again"). This path sent none at all, so every
+// quick-action button was rejected server-side while the UI cleared itself and looked like nothing
+// had happened -- the pane stayed blocked and the buttons reappeared on the next broadcast. The
+// caller passes the prompt_id of the agent card it drew the button from; mirror.js already did.
+function respond(t, promptId){
   if(!ws||!activePane)return;
   if(window.cue)cue('success');
-  // The relay drops a respond whose prompt_id does not match what the pane is showing -- and a
-  // missing one never matches, since question_prompt_id hashes the screen even when it detects no
-  // question. Send the one that arrived with the blocked message, as sendText() already does.
-  const agent=agents.find(a=>a.pane_id===activePane);
   pendingFreeText=null;   // an option button is not the typed text
-  ws.send(JSON.stringify({type:'respond',pane_id:activePane,prompt_id:agent?.prompt_id,text:t}));
+  ws.send(JSON.stringify({type:'respond',pane_id:activePane,prompt_id:promptId||agents.find(a=>a.pane_id===activePane)?.prompt_id||'',text:t}));
   document.getElementById('quickActions').innerHTML='';
   setTimeout(refreshPane,500);
 }

@@ -1,3 +1,11 @@
+// The approval options whose labels were designed to be cut at the first comma. They mirror
+// TOOL_OPTIONS and SUBAGENT_OPTIONS in herdr_relay.py -- keep the two lists in step. Every other
+// option (notably Claude's numbered permission menu) keeps its full label; see the render below.
+const SHORT_LABEL_OPTIONS = new Set([
+  'yes, single permission', 'trust, always allow', 'no (tab to edit)',
+  'approve all pending', 'configure individually', 'exit (cancel subagents)',
+]);
+
 // ---- What a pane row is CALLED ---------------------------------------------
 //
 // Two questions, not one, so two functions and an explicit scope rather than one function guessing
@@ -49,9 +57,14 @@ function paneParts(p) {
   // exists to untangle (several agents in ONE project) the cwd is identical on every row, so it
   // discriminates nothing.
   const tabCount = tabCountBySpace.get(agentWorkspaceKey(p)) || 0;
+  // The agent's own name beats the tab's. Both answer "which of this space's rows is this one",
+  // but the name says it: a herd of `dre-exec` / `dre-rev-1` / `dre-rev-2` all sit in one tab, so
+  // the tab label separated none of them and rendered as the bare tab number -- `DRE · 1` three
+  // times. The tab label stays as the fallback for a pane with no agent name.
+  const label = (p.label || '').trim();
   return {
     project,
-    tab: meaningfulTabLabel(tabLabelByKey.get(agentTabKey(p)), tabCount),
+    tab: label || meaningfulTabLabel(tabLabelByKey.get(agentTabKey(p)), tabCount),
     secondary: herdSecondary(p, project),
   };
 }
@@ -66,7 +79,10 @@ function paneTitleInTab(p) {
  *  label, their tab and their cwd are all empty or identical and the row would read
  *  `tuyaos-ai-qemu` three times. */
 function herdSecondary(p, project) {
-  return (p.label || p.title || '') || informativeCwd(p, project) || p.pane_id;
+  // The label is deliberately NOT first any more: paneParts() now puts it in the title, and
+  // repeating it here cost the row its only live field -- `DRE · dre-exec` over `claude ·
+  // dre-exec`, where line two used to carry what the agent was actually doing.
+  return (p.title || '') || informativeCwd(p, project) || p.pane_id;
 }
 
 /** Line one, as spans. See paneParts for why it is not a string. */
@@ -456,7 +472,12 @@ function openTerminal(paneId) {
       const button = document.createElement('button');
       const lower = option.toLowerCase();
       button.className = lower.includes('yes')||lower.includes('approve')?'btn-yes':lower.includes('trust')?'btn-trust':'btn-no';
-      button.textContent = option.split(',')[0];
+      // Codex's fixed option set reads well cut at the first comma ("yes, single permission" ->
+      // "yes"). Claude's numbered menu is all "Yes, and ..." variants, so the same cut collapsed
+      // every option to Yes/Yes/Yes/No and the menu became unusable. Only the options the cut was
+      // designed for get it; anything else keeps its full label and wraps onto its own row.
+      button.textContent = SHORT_LABEL_OPTIONS.has(lower) ? option.split(',')[0] : option;
+      if (button.textContent.length > 18) button.classList.add('opt-long');
       if (a.interaction==='omp_question'&&a.multi) {
         button.dataset.selected=String((a.selected_options||[]).includes(option));
         button.classList.toggle('selected',button.dataset.selected==='true');
@@ -467,7 +488,7 @@ function openTerminal(paneId) {
           ws.send(JSON.stringify({type:'question_toggle',pane_id:activePane,prompt_id:a.prompt_id,option}));
         });
       } else {
-        button.addEventListener('click',()=>respond(option));
+        button.addEventListener('click',()=>respond(option, a.prompt_id));
       }
       qa.appendChild(button);
     }
@@ -486,7 +507,7 @@ function openTerminal(paneId) {
         const button = document.createElement('button');
         button.className = cls;
         button.textContent = label;
-        button.addEventListener('click',()=>respond(response));
+        button.addEventListener('click',()=>respond(response, a.prompt_id));
         ak.appendChild(button);
       }
     }
