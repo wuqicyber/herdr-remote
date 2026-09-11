@@ -28,7 +28,7 @@ class ClientPayloadTests(unittest.TestCase):
     def test_web_respond_carries_the_prompt_id(self):
         # Without one the relay answers "prompt changed" to every button on a blocked pane.
         # tests/test_web_respond.py drives it; this runs where no chromium does.
-        self.assertIn("type:'respond',pane_id:activePane,prompt_id:agent?.prompt_id", web_source())
+        self.assertIn("type:'respond',pane_id:activePane,prompt_id:promptId||", web_source())
 
     def test_swift_models_decode_omp_question_state(self):
         for relative_path in (
