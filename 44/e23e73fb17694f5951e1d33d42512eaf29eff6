@@ -1,0 +1,39 @@
+relay/.env.example
+  s_5d8b0f74a83ba3::t_202fe05e9d63c2 12-17
+relay/herdr_relay.py
+  s_5d8b0f74a83ba3::t_5fee98e172549c 127-136,656,666,669-674,686-692,828-855,949,973-976,1605-1682,1705-1717,1745-1748,1764,2357-2359,2366-2372,2538-2545,2816-2822
+relay/herdr_telegram.py
+  s_5d8b0f74a83ba3::t_2b99cbe3619d30 47,600-637,757-759,781-783,831-846,857-859,943-946
+relay/install-service.sh
+  s_5d8b0f74a83ba3::t_e3a0b1d58f1f9c 393-456,983,1507-1519,1521-1523
+tests/install-service.sh
+  s_5d8b0f74a83ba3::t_aeb3e2abc71ed3 21-28,154-155,358-390
+tests/test_herdr_relay.py
+  s_5d8b0f74a83ba3::t_afcf1642e13188 443-447,453,465-466,479,485-531,539,3032-3210
+tests/test_telegram.py
+  s_5d8b0f74a83ba3::t_ef8cf31ca40e6c 402-404,750-875
+tests/test_web_spaces.py
+  s_5d8b0f74a83ba3::t_46b09e21218475 465-471,477-479
+web/app.css
+  s_5d8b0f74a83ba3::t_88eea6b24c20d0 40-49,76-83,92-95,100-103,120-122,137-142,144-147,153-157,406-409,414-416
+web/js/cards.js
+  s_5d8b0f74a83ba3::t_b5c3f3880127a7 1-8,60-64,67,82-85,475-480,491,510
+web/js/diff.js
+  s_5d8b0f74a83ba3::t_1ad52a6cb82651 45-49
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "44e23e73fb17694f5951e1d33d42512eaf29eff6",
+  "prompts": {},
+  "sessions": {
+    "s_5d8b0f74a83ba3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "269a6a64-8b9e-4796-983e-5cc9c7140377",
+        "model": "claude-opus-5"
+      },
+      "human_author": "eleanor.zhu <eleanore.zhu@gmail.com>"
+    }
+  }
+}
