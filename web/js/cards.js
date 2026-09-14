@@ -6,6 +6,13 @@ const SHORT_LABEL_OPTIONS = new Set([
   'approve all pending', 'configure individually', 'exit (cancel subagents)',
 ]);
 
+// The free-text row of a question menu. Mirrors QUESTION_FREE_TEXT_LABELS in herdr_relay.py:
+// there it is kept out of the prompt_id, here out of "still selected", because choosing it is
+// how you open the text box, not one of the answers you picked.
+const FREE_TEXT_LABELS = new Set([
+  'type something', 'type something.', 'other (type your own)',
+]);
+
 // ---- What a pane row is CALLED ---------------------------------------------
 //
 // Two questions, not one, so two functions and an explicit scope rather than one function guessing
@@ -422,6 +429,58 @@ function clearPaneMirror() {
   el.scrollTop = 0;
 }
 
+// The approval dock is built by openTerminal, which is only re-entered on a `blocked` message --
+// so nothing emptied it when the pane stopped being blocked. Pressing Submit left the option
+// buttons on screen over a question that had already been answered, and the same was true of an
+// approval answered at the desk or by another client. `respond` cleared the dock itself, which
+// covered its own path and hid the gap for everything else.
+//
+// Driven from render(), which runs on every snapshot, so the dock's lifetime is tied to the
+// pane's status rather than to which message happened to arrive.
+// Submit clears the dock the way respond() does: the round trip is long enough that leaving the
+// buttons live invites a second press on a question already being submitted. A refusal re-broadcasts
+// the pane's real state, which draws them straight back.
+function submitQuestion(promptId) {
+  if (!ws || !activePane) return;
+  if (window.cue) cue('success');
+  ws.send(JSON.stringify({type:'question_submit', pane_id:activePane, prompt_id:promptId||''}));
+  document.getElementById('quickActions').replaceChildren();
+  document.getElementById('actionKeys').replaceChildren();
+  setTimeout(refreshPane, 500);
+}
+
+
+// A refusal the relay attributed to this pane, while it is still recent, or null. The relay
+// re-sends the pane's true state right after refusing, so by the time this renders the controls
+// beside it are already correct -- this says WHY one of them sprang back.
+//
+// Drawn by BOTH dock branches. Submit exists in typing mode too, so a refusal there would
+// otherwise be a sound and nothing else -- which is the exact failure this notice was added to
+// end, reappearing on the one path that came with it.
+function questionErrorHint(paneId) {
+  if (!questionError || questionError.pane_id !== paneId) return null;
+  if (Date.now() - questionError.at >= QUESTION_ERROR_MS) return null;
+  const failed = document.createElement('div');
+  failed.className = 'qa-hint qa-error';
+  failed.textContent = questionError.option
+    ? `\u26a0 ${questionError.option}: ${questionError.message}`
+    : `\u26a0 ${questionError.message}`;
+  return failed;
+}
+
+
+function clearDockIfAnswered() {
+  if (!activePane) return;
+  const a = agents.find(x => x.pane_id === activePane);
+  if (a && a.status === 'blocked') return;
+  const qa = document.getElementById('quickActions');
+  const ak = document.getElementById('actionKeys');
+  if (qa && qa.firstChild) qa.replaceChildren();
+  if (ak && ak.firstChild) ak.replaceChildren();
+  // Re-arm the one-shot keyboard focus, so the next question on this pane gets it again.
+  if (textFieldFocusedFor === activePane) textFieldFocusedFor = null;
+}
+
 function openTerminal(paneId) {
   // Re-entered on every blocked event for the pane already open, so only a real switch closes these
   // -- the history panel belongs to one conversation, and the search holds the OTHER pane's output
@@ -464,8 +523,87 @@ function openTerminal(paneId) {
   const ak = document.getElementById('actionKeys');
   qa.replaceChildren();
   ak.replaceChildren();
-  if (a&&a.status==='blocked') {
-    const opts = a.interaction==='omp_question'&&a.multi
+  if (a&&a.status==='blocked'&&a.text_field) {
+    // A text field on the pane has focus, which the relay reports because nothing else in the
+    // message says so: Claude's "Type something." turns one of the menu's own rows into an input
+    // rather than opening a second screen, so the option list is still there and still parses.
+    // Buttons drawn from it cannot work -- the field takes a digit as a character, and the arrow
+    // keys are the only way back to the list -- so say what is wanted instead of offering taps
+    // that would type their own label into the box. No focus() here: this card is rebuilt from
+    // every snapshot, and pulling up the keyboard twice a second is worse than not pulling it up.
+    const typed = (a.text_value || '').trim();
+    const hint = document.createElement('div');
+    hint.className = 'qa-hint';
+    // Show what is already in the row. Sending replaces it rather than appending -- `send-text`
+    // appends, so before that a typo made on a phone could not be corrected at all -- but the
+    // reader still cannot see the row without scrolling the mirror, and a reply box that silently
+    // overwrites something invisible is its own trap.
+    hint.textContent = typed
+      ? `Answer: ${typed} \u2014 type below to replace it`
+      : 'Type your answer below, then Send';
+    qa.appendChild(hint);
+    // Tapping "Type something" is a request for somewhere to type, so give them the keyboard --
+    // once, on the way in. The relay has already walked the pane's cursor onto that row, which is
+    // what opens the input; before that change the tap lit a button and produced no box at all.
+    if (textFieldFocusedFor !== paneId) {
+      textFieldFocusedFor = paneId;
+      const input = document.getElementById('termInput');
+      if (input) setTimeout(()=>input.focus(), 0);
+    }
+    // What you had already ticked is still ticked on the pane, but choosing the free-text row
+    // replaces the whole dock -- so without this the selection you spent four taps on is simply
+    // gone from the screen while you type, and there is no way to check it before submitting.
+    const kept = Array.isArray(a.selected_options) ? a.selected_options.filter(
+      o => o && !FREE_TEXT_LABELS.has(o.toLowerCase())) : [];
+    if (kept.length) {
+      const chosen = document.createElement('div');
+      chosen.className = 'qa-hint';
+      chosen.textContent = 'Still selected: ' + kept.join(', ');
+      qa.appendChild(chosen);
+    }
+    const refused = questionErrorHint(paneId);
+    if (refused) qa.appendChild(refused);
+    // The only way off the input row is an arrow key -- Escape cancels the entire question and
+    // throws the selection away, which is not what "go back" means. Without a control for it a
+    // reader who taps the free-text row by accident is stuck in a text box with no exit.
+    // Submit belongs here too. It was only drawn on the options branch, so typing an answer took
+    // the one control that finishes the question off the screen -- the reader was left holding a
+    // typed reply and no way to send it. The relay steps the pane's cursor off the input on its
+    // own, so this is the same button it is over there.
+    const submitText = document.createElement('button');
+    submitText.className = 'btn-yes';
+    submitText.textContent = 'Submit';
+    submitText.addEventListener('click',()=>submitQuestion(a.prompt_id));
+    qa.appendChild(submitText);
+    // Emptying the row is the one edit Send cannot express, since an empty message sends nothing.
+    // Backspace reaches that row (measured), and the relay reports how much is in it, so this
+    // needs no new message -- it is the keys the reader would press if they were at the desk.
+    if (typed) {
+      const clear = document.createElement('button');
+      clear.className = 'btn-no';
+      clear.textContent = 'Clear';
+      // One Backspace per CHARACTER: [...typed], not typed.length, which counts an emoji as
+      // two and would eat the character before it. The relay counts that row in code points.
+      clear.addEventListener('click',()=>sendKeys(Array([...typed].length).fill('Backspace')));
+      qa.appendChild(clear);
+    }
+    const back = document.createElement('button');
+    back.className = 'btn-no';
+    back.textContent = '\u2190 Back to options';
+    // Down, not Up: the free-text row is the LAST of the menu's checkboxes, so Down steps off it
+    // onto "Chat about this" while Up would walk back up into the options -- and Escape, the other
+    // obvious candidate, cancels the whole question and discards everything already ticked.
+    back.addEventListener('click',()=>sendKey('Down'));
+    qa.appendChild(back);
+  } else if (a&&a.status==='blocked') {
+    if (textFieldFocusedFor === paneId) textFieldFocusedFor = null;
+    // Two interactions carry a checkbox list: omp's own question grammar, and the numbered
+    // checkbox menu every other harness draws (claude's AskUserQuestion with multiSelect). They
+    // differ only in the keys the RELAY presses; the protocol shape a client sees is identical,
+    // so both route here rather than one of them falling through to the plain-options branch,
+    // where a tap would report an answer the agent never received.
+    const multiQuestion = (a.interaction==='omp_question'||a.interaction==='multi_question')&&a.multi;
+    const opts = multiQuestion
       ? (Array.isArray(a.multi_options)?a.multi_options:[])
       : (Array.isArray(a.options)?a.options:[]);
     for (const option of opts) {
@@ -478,7 +616,7 @@ function openTerminal(paneId) {
       // designed for get it; anything else keeps its full label and wraps onto its own row.
       button.textContent = SHORT_LABEL_OPTIONS.has(lower) ? option.split(',')[0] : option;
       if (button.textContent.length > 18) button.classList.add('opt-long');
-      if (a.interaction==='omp_question'&&a.multi) {
+      if (multiQuestion) {
         button.dataset.selected=String((a.selected_options||[]).includes(option));
         button.classList.toggle('selected',button.dataset.selected==='true');
         button.addEventListener('click',()=>{
@@ -492,13 +630,15 @@ function openTerminal(paneId) {
       }
       qa.appendChild(button);
     }
-    if (a.interaction==='omp_question'&&a.multi) {
+    const refused = questionErrorHint(paneId);
+    if (refused) qa.appendChild(refused);
+    if (multiQuestion) {
       const submit=document.createElement('button');
       submit.className='btn-yes';
       submit.textContent='Submit';
-      submit.addEventListener('click',()=>ws.send(JSON.stringify({type:'question_submit',pane_id:activePane,prompt_id:a.prompt_id})));
+      submit.addEventListener('click',()=>submitQuestion(a.prompt_id));
       qa.appendChild(submit);
-    } else if (a.interaction!=='omp_question'&&opts.includes('yes, single permission')) {
+    } else if (!multiQuestion&&opts.includes('yes, single permission')) {
       for (const [label,cls,response] of [
         ['y','key-green','yes, single permission'],
         ['a','key-blue','trust, always allow'],

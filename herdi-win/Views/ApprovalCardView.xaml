@@ -95,9 +95,10 @@
             </ScrollViewer>
         </Border>
 
-        <!-- Multi-select question: checkboxes + Submit.
-             NOTE: the current relay has no handler for question_toggle/question_submit,
-             so this path is inert until it grows one — same as on every other client. -->
+        <!-- Multi-select question: checkboxes + Submit. Bound to Multi alone, which the relay
+             sets for both of its checkbox interactions (omp's own question grammar, and the
+             numbered checkbox menu claude draws for AskUserQuestion(multiSelect)) — the keys
+             behind them differ, but that is the relay's side of the wire, not this one's. -->
         <StackPanel Margin="12,10,12,0"
                     Visibility="{Binding ActiveAgent.IsMultiSelect, Converter={StaticResource BoolToVis}}">
             <ItemsControl ItemsSource="{Binding MultiOptions}">

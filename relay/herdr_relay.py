@@ -87,6 +87,25 @@ PANE_WALK_LIMIT = 6
 WS_PORT = int(os.environ.get("HERDR_RELAY_PORT", "8375"))
 RELAY_HOST = os.environ.get("HERDR_RELAY_HOST", "127.0.0.1")
 POLL_INTERVAL = 2
+# Reading an idle agent pane to see whether it is really sitting on a question herdr's own
+# detection missed (see pane_awaiting_answer). Every such read is a herdr call -- an SSH round
+# trip on a remote host -- so it is NOT done every tick for every pane. A pane is read when its
+# status has just changed (an agent that stops working is exactly when a question appears), when
+# it is already known to hold one, and otherwise once every QUESTION_PROBE_INTERVAL ticks as a
+# backstop for panes that were already waiting when the relay started. Set HERDR_QUESTION_PROBE=0
+# to switch the whole thing off and take herdr's status at face value.
+QUESTION_PROBE = os.environ.get("HERDR_QUESTION_PROBE", "").strip().lower() not in {
+    "0", "false", "no", "off",
+}
+QUESTION_PROBE_INTERVAL = max(1, int(os.environ.get("HERDR_QUESTION_PROBE_POLLS", "5") or 5))
+# Which herdr statuses can be hiding an unanswered question. `working` cannot -- the agent is
+# running -- and `blocked` needs no help, the poll already reads it. Everything else can, and
+# `done` is not a curiosity: it is what `pane list` reports for the very pane this was built for.
+# herdr has two vocabularies here and they disagree on the same pane at the same moment --
+# measured, `pane list` said `done` for w8:p1 while `agent explain` said `idle` -- and it is
+# `pane list` the relay ships. Naming the two that are excluded, rather than the ones allowed,
+# is what stops a third spelling from silently switching the feature off again.
+QUESTION_PROBE_SKIP_STATUSES = frozenset({"working", "blocked"})
 AUTH_TOKEN = os.environ.get("HERDR_RELAY_TOKEN", "")  # Optional: shared secret for relay auth
 TRUSTED_ORIGINS = [o.strip().lower() for o in os.environ.get("HERDR_TRUSTED_ORIGINS", "").split(",") if o.strip()]
 
@@ -164,6 +183,13 @@ REMOTES = [r.strip() for r in os.environ.get("HERDR_REMOTES", "").split(",") if 
 
 TOOL_OPTIONS = ["yes, single permission", "trust, always allow", "no (tab to edit)"]
 SUBAGENT_OPTIONS = ["approve all pending", "configure individually", "exit (cancel subagents)"]
+# Lines read_pane drops as chrome. NOTE: `esc to cancel` here is CASE-SENSITIVE on purpose and
+# must stay that way. question_footer_at_bottom looks for that same phrase to tell a live question
+# from a picture of one, and it only ever sees what read_pane kept -- claude spells its footer
+# `Esc to cancel`, so the two coexist. Adding re.IGNORECASE here would delete the footer on a wide
+# pane before the probe could read it, and pane_awaiting_answer would go quiet with nothing to say
+# why. (A narrow pane is safe either way: the wrap that defeats herdr's own literal defeats this
+# one too.) tests/test_herdr_relay.py pins both halves.
 CHROME_RE = re.compile(
     r"^[\s\u2500\u2501\u2550_\u2014\u2502|\u25d4\u25d1\u25d5\u25cf\s]+$"
     r"|Kiro\s[\u00b7\u2022]"
@@ -204,6 +230,11 @@ _activity_status = {}
 _activity_dirty = False
 _activity_flush_task = None
 last_blocked_prompts = {}
+# (host, pane_id) -> does this idle pane hold a question. Keyed with the host like the activity
+# ledger, because every herdr numbers its own panes.
+question_panes = {}
+question_probe_status = {}
+_question_probe_tick = 0
 event_queue = asyncio.Queue()
 pane_remote_map = {}
 # pane_id -> the raw agent_session ref herdr reports (kind id|path + value). Kept server-side
@@ -1619,6 +1650,313 @@ def detect_approval_options(text):
 NUMBERED_OPTION_RE = re.compile(r"^(\s*(?:[❯>›»▶]\s*)?)(\d{1,2})[.)]\s+(\S.*?)\s*$")
 
 
+# Claude draws a MULTI-SELECT question (AskUserQuestion with multiSelect) as a numbered menu
+# whose rows carry a checkbox, with one description line per option:
+#
+#     ←  ☐ Caps  ✔ Submit  →
+#     Which capabilities?
+#     ❯ 1. [ ] Color output
+#       Use ANSI colors in rendered output.
+#       2. [✔] Nerd Font
+#       Assume a Nerd Font is installed and use its glyphs/icons.
+#       5. [ ] Type something
+#          Submit
+#       6. Chat about this
+#     Enter to select · ↑/↓ to navigate · Esc to cancel
+#
+# Live-probed on claude 2.1.269 / herdr 0.9.0: pressing a row's DIGIT toggles that row's box and
+# leaves the menu up (the header's own box goes ☐ -> ☒); `Right` walks to the Submit tab, which
+# is an ordinary numbered menu ("1. Submit answers", "2. Cancel"). Digits are absolute -- they do
+# not depend on where the cursor sits -- which is what makes this drivable from a client that
+# only ever sends one key, and it is why this needs no cursor arithmetic the way omp's does.
+#
+# detect_numbered_options() cannot see this menu at all. Every option carries a description line
+# indented to exactly the number column, which is neither the next number nor a DEEPER-indented
+# continuation, so the run resets on the first description and never reaches the two options a
+# menu needs. Measured against a live pane it returns [] -- which is why a multi-select question
+# reached every client as `interaction: "prompt"` with no options and nothing to tap. A separate
+# detector is cheaper than widening that rule and cannot regress the approval menus it was
+# written for, because an approval row has no `[ ]` in it.
+# The LABEL IS OPTIONAL, which is the whole reason this is one regex rather than two: the
+# free-text row loses its label the moment it becomes the input (`5. [ ] Type something` renders
+# as `5. [✔]`), and a row that vanished from the run would break the numbering every reader here
+# counts on. detect_checkbox_options drops the unlabelled rows afterwards -- a row with no label
+# is not an option a client can name -- but checkbox_rows still counts them.
+CHECKBOX_ROW_RE = re.compile(
+    r"^\s*(?P<cursor>[❯>›»▶]\s*)?(?P<number>\d{1,2})[.)]\s+"
+    r"\[(?P<marker>[ xX✔✓]?)\]"
+    r"(?:\s+(?P<label>\S.*?))?\s*$"
+)
+CHECKBOX_CHECKED = {"x", "X", "✔", "✓"}
+# The menu's own "Submit" line, which sits directly under the free-text row and carries no number
+# of its own. Stepping off the input lands the cursor on it, and Enter there opens the review
+# screen -- the same place the Submit TAB leads, reached without a tab walk.
+INLINE_SUBMIT_RE = re.compile(r"^\s*[❯>›»▶]\s*Submit\s*$")
+# Claude asks at most a handful of questions in one group; each is a tab, and Submit is the tab
+# past the last of them. Bounds the walk in submit_checkbox_question so a screen that never
+# reaches a review cannot press Right forever.
+QUESTION_TAB_LIMIT = 6
+
+
+# The free-text row of a question menu ("Type something", omp's "Other (type your own)").
+# Excluded from the prompt_id hash because CHOOSING it deletes its own label: the row becomes an
+# input, `5. [ ] Type something` renders as `5. [✔]`, and the label set the id is computed over
+# drops from five to four. The id would change at the exact moment the reader starts typing, and
+# the Send that follows would be refused as "prompt changed" -- the answer they just typed thrown
+# away. It is never a discriminator between two questions anyway: every menu has one.
+QUESTION_FREE_TEXT_LABELS = {
+    "type something", "type something.", QUESTION_OTHER.casefold(),
+}
+
+
+def hashable_option_labels(rows):
+    return [
+        row["label"] for row in rows
+        if row["label"].casefold() not in QUESTION_FREE_TEXT_LABELS
+    ]
+
+
+# Claude keeps its own viewport: new output above pushes the menu below the fold and it draws
+# "1 new message (ctrl+End)" / "Jump to bottom (ctrl+End)" where the footer would be. A
+# `--source visible` read -- which is the only kind anything on a timer may do -- then returns a
+# screen with NO menu on it, and every question handler reads that as "the question is gone".
+# Measured: with the pane scrolled, toggling Push, Widgets and Telegram all returned False and
+# changed nothing, while the same three succeeded once the pane was at the bottom. Matched on
+# whitespace-normalised text for the same reason custom_editor_active is: it is a footer, and a
+# footer wraps.
+def pane_scrolled_away(text):
+    return "(ctrl+end)" in " ".join(text.split()).lower()
+
+
+def reveal_question_menu(pane_id, remote=None):
+    """Bring a scrolled-away menu back into the viewport, and answer with the fresh screen.
+
+    ctrl+End is claude's own "jump to bottom", and it is the key claude itself advertises in the
+    indicator above. It goes out as CSI bytes through send-text because herdr's validator refuses
+    every spelling of End (see key_escape_sequence). This moves the operator's view -- but only
+    to the question they are being asked to answer, and only when a client has just tried to
+    answer it.
+    """
+    sequence = key_escape_sequence("ctrl+End")
+    if not sequence or not _mutate_herdr(
+        "pane", "send-text", pane_id, sequence, remote=remote
+    ):
+        return None
+    time.sleep(0.2)
+    return read_pane(pane_id, remote=remote)
+
+
+def question_screen(pane_id, remote=None):
+    """The pane's screen, scrolled back to the question if it had drifted off the viewport."""
+    content = read_pane(pane_id, remote=remote)
+    if detect_checkbox_options(content) or not pane_scrolled_away(content):
+        return content
+    return reveal_question_menu(pane_id, remote=remote) or content
+
+
+def checkbox_rows(text):
+    """The last `N. [ ] …` checkbox run on screen, or [] when there is none.
+
+    Each row is {"number", "label", "checked", "cursor"}, where `number` is the key that toggles
+    it. A run counts up from 1, and a line matching nothing is SKIPPED rather than ending the run,
+    because a description sits between every pair of options by construction. Two rows are the
+    minimum, so a lone "1. [ ] x" in ordinary output is not a menu, and the last complete run wins
+    -- the menu is drawn under whatever the agent printed earlier, exactly as in
+    detect_numbered_options.
+
+    EVERY reader of this menu goes through here, because the four of them disagreeing is not a
+    theoretical risk: they used to, and it broke the feature outright. detect_checkbox_options
+    took the last run while free_text_row_number, free_text_value and checkbox_field_focused took
+    `max()` over the whole screen -- so an agent that had printed its own numbered checklist above
+    the question ("7. [ ] write the changelog") made those three point at a row of the CHECKLIST.
+    Measured on such a screen: the options read 1..3 correctly, the free-text row read 7, its
+    value read "write the changelog", and typing mode was never detected -- which left the card
+    drawing option buttons whose digits were typed INTO the reader's answer, Submit pressing
+    `Right` from inside the input (which does nothing), and the text walked six rows down a
+    four-row menu before being sent.
+    """
+    best = []
+    current = []
+    for line in text.splitlines():
+        match = CHECKBOX_ROW_RE.match(line)
+        if not match:
+            continue
+        label = match.group("label")
+        row = {
+            "number": int(match.group("number")),
+            "label": (label or "").strip(),
+            "checked": match.group("marker") in CHECKBOX_CHECKED,
+            "cursor": bool(match.group("cursor")),
+        }
+        if row["number"] == 1:
+            current = [row]
+        elif current and row["number"] == current[-1]["number"] + 1:
+            current.append(row)
+        else:
+            current = []
+            continue
+        if len(current) >= 2:
+            best = list(current)
+    return best
+
+
+def detect_checkbox_options(text):
+    """The rows of that menu a client can be offered: the ones that still carry a label."""
+    return [
+        {"number": row["number"], "label": row["label"], "checked": row["checked"]}
+        for row in checkbox_rows(text) if row["label"]
+    ]
+
+
+# Any numbered menu row, with the cursor captured. Looser than CHECKBOX_ROW_RE because the cursor
+# can be parked on a row that carries no checkbox at all ("6. Chat about this").
+MENU_CURSOR_RE = re.compile(r"^\s*(?P<cursor>[❯>›»▶]\s*)?(?P<number>\d{1,2})[.)]\s")
+
+
+def menu_cursor_row(text):
+    """The number of the menu row the cursor sits on, or None."""
+    for line in text.splitlines():
+        match = MENU_CURSOR_RE.match(line)
+        if match and match.group("cursor"):
+            return int(match.group("number"))
+    return None
+
+
+def free_text_row(text):
+    """A checkbox menu's free-text row, or None.
+
+    It is the LAST row of the run: claude puts it under the real options, with "Chat about this"
+    -- which carries no checkbox -- below that. Its label cannot be used to find it, because the
+    row holds whatever has been typed into it a keystroke after it opens.
+    """
+    rows = checkbox_rows(text)
+    return rows[-1] if rows else None
+
+
+def free_text_row_number(text):
+    """The number of that row -- the digit that ticks it -- or None."""
+    row = free_text_row(text)
+    return row["number"] if row else None
+
+
+def free_text_value(text):
+    """What has been typed into a checkbox menu's free-text row, or "".
+
+    The row shows its placeholder ("Type something") until the first keystroke and the typed text
+    afterwards, so the placeholder reads as content unless it is named. Reported on the card as
+    `text_value`, because a client that cannot see what is already in the row cannot offer to
+    clear it -- and the pane mirror is the only other place it appears.
+    """
+    row = free_text_row(text)
+    if not row:
+        return ""
+    return "" if row["label"].casefold() in QUESTION_FREE_TEXT_LABELS else row["label"]
+
+
+def focus_menu_row(pane_id, content, number, remote=None):
+    """Walk the menu cursor onto one row, which is what OPENS that row if it is the input.
+
+    Pressing a row's digit ticks its box and nothing else: measured, tapping "Type something"
+    left the cursor on row 1, no field open, custom_editor_active False -- so the reader got a
+    ticked box, no text box, no keyboard, and a Send that the relay then refused outright with
+    "free-text response requires a detected question". The field opens when the CURSOR reaches
+    the row, which is a walk, not a keypress.
+    """
+    current = menu_cursor_row(content)
+    if current is None:
+        return False
+    if current == number:
+        return True
+    direction = "Down" if number > current else "Up"
+    return _mutate_herdr(
+        "pane", "send-keys", pane_id, *([direction] * abs(number - current)), remote=remote
+    )
+
+
+def checkbox_field_focused(text):
+    """True when the cursor sits on a checkbox menu's free-text row, so typing lands in the pane.
+
+    custom_editor_active() cannot answer this for a checkbox menu, and believing it could is what
+    made "Type something" a dead end. Its signal is the footer gaining "ctrl+g to edit in <editor>"
+    -- which on THIS menu appears as soon as the free-text row is TICKED and stays while the
+    cursor is somewhere else entirely. Measured: with the row ticked and the cursor parked on
+    "Chat about this", the footer still advertised ctrl+g, so every client switched to its
+    text-only branch, dropped all four checkboxes and the Submit button, and offered no way back
+    -- the question became unanswerable from the phone.
+
+    The free-text row is the LAST checkbox row of the menu (claude puts it under the real options
+    and "Chat about this", which carries no checkbox, below that), so the cursor being on it is
+    the discriminator. Reading the row's LABEL instead does not work: it is empty while the input
+    is untouched but holds whatever has been typed a keystroke later.
+    """
+    row = free_text_row(text)
+    return bool(row) and row["cursor"]
+
+
+# How many trailing lines the footer may occupy. It is one line on a wide pane and wraps to two
+# or three on a narrow one, which is the whole reason this feature exists.
+QUESTION_FOOTER_TAIL_LINES = 4
+
+
+def question_footer_at_bottom(text):
+    """True when the dialog's footer is the last thing on the screen.
+
+    A live prompt owns the bottom of its pane. The SAME menu as ordinary output -- an agent that
+    printed one, a transcript being read back, a session testing this very feature -- has the
+    agent's own composer and status line below it, and is not a question anybody can answer.
+
+    Without this the probe promoted such a pane to `blocked` and served another pane's option
+    list on it; the checkbox dock then replaced the reply box, so the reader could not even type
+    a message to the agent whose pane it actually was. Reported from the phone, and reproduced
+    exactly: the live menu and the same menu with a prompt under it both answered True.
+
+    The screen this reads has already been through read_pane, whose CHROME_RE drops any line
+    holding a LOWERCASE `esc to cancel`. Claude writes `Esc`, so the footer survives -- see the
+    note on CHROME_RE, because that is a coupling between two rules that look unrelated.
+    """
+    lines = [line for line in text.splitlines() if line.strip()]
+    tail = " ".join(" ".join(lines[-QUESTION_FOOTER_TAIL_LINES:]).split()).lower()
+    return "esc to cancel" in tail and (
+        "enter to select" in tail or "enter to confirm" in tail
+    )
+
+
+def pane_awaiting_answer(text):
+    """True when this screen is a question waiting to be answered, whatever herdr's status says.
+
+    herdr decides `blocked` from the dialog's own footer, and that footer WRAPS. claude's question
+    footer -- "Enter to select · ↑/↓ to navigate · Esc to cancel" -- is 49 cells, and its rule
+    (`live_blocked_form`, priority 980) needs `esc to cancel` as a literal after the last
+    horizontal rule. On a pane narrower than that the phrase is split across two lines, the
+    literal is not found, and detection falls through to `live_prompt_box` (950, **idle**).
+
+    Measured on one pane, one question, two widths: 103 columns answered
+    `state: blocked, rule: live_blocked_form`; 46 columns answered `state: idle, rule:
+    live_prompt_box`. The control is claude's own trust dialog, whose footer is 32 cells and does
+    not wrap -- herdr reports that one blocked at 46 columns.
+
+    A pane's width is not a setting: it follows whatever terminal is attached, so connecting to
+    the host from a phone shrinks every pane to the handset's width. The question is therefore
+    least likely to be noticed in exactly the situation a remote client is the only way to answer
+    it. This is the relay declining to inherit that.
+
+    Matched on whitespace-normalised text, which is the entire point -- it is the wrap, not the
+    words, that herdr's rule loses. The checkbox menu short-circuits because its rows are
+    unambiguous on their own: `N. [ ] Label` twice over is an AskUserQuestion and nothing else.
+    """
+    # The footer is checked FIRST and at the bottom, because it is the only thing that separates
+    # a question from a picture of one. A checkbox menu is unmistakable in shape but says nothing
+    # about whether it is live.
+    if not question_footer_at_bottom(text):
+        return False
+    return bool(detect_checkbox_options(text)) or bool(detect_numbered_options(text))
+
+
+# A horizontal rule: box-drawing or ASCII dashes only, at least three of them. Used by
+# detect_numbered_options to step over a divider drawn inside a menu.
+MENU_RULE_RE = re.compile(r"^[\u2500-\u257f\u2014\u2013\-=_]{3,}$")
+
+
 def detect_numbered_options(text):
     """Labels of the last `1.`..`N.` menu on screen, in order, or [] when there is none.
 
@@ -1650,6 +1988,14 @@ def detect_numbered_options(text):
             continue
         stripped = line.strip()
         if not stripped:
+            continue
+        if current and MENU_RULE_RE.match(stripped):
+            # Claude draws a rule between the answers it was given and the two it always adds
+            # ("Type something.", "Chat about this"). The rule sits at column 0, so it is neither
+            # the next number nor a deeper-indented continuation and it ended the run -- losing
+            # every option below it. On a question menu that is the LAST option, which no client
+            # could then reach. It carries no label, so skipping it cannot invent one, and a run
+            # still ends at the first line that is genuinely neither.
             continue
         indent = len(line) - len(line.lstrip())
         if current and number_col is not None and indent > number_col:
@@ -1695,13 +2041,53 @@ def detect_options(text):
 
 
 def custom_editor_active(text):
-    return "Enter your response:" in text or (
-        "Custom answer:" in text and "submit" in text.lower()
+    """True when a free-text field on the pane has focus, so typed text must be sent AS TEXT.
+
+    Claude's "Type something." is not a second screen. Choosing it leaves the whole numbered
+    menu on display and turns that one row into an inline input -- so the option list still
+    parses, the relay still read it as a menu, and everything a reader typed was matched against
+    the labels and sent as a KEY PRESS. A digit landed in the field as a character ("3", then
+    "33" on the second try), a sentence that happened to equal a label pressed that label's
+    number, and anything else was refused outright as "free-text response requires a detected
+    question". The menu never closed, because nothing had been selected.
+
+    The one thing that changes between the two states is the dialog's own footer: it gains
+    "ctrl+g to edit in <editor>" exactly while the field has focus. The editor name is the
+    reader's $EDITOR, so only the invariant half is matched. Verified against captures of all
+    four states -- cursor on an ordinary option (absent), cursor on the field (present), and the
+    field holding one and two typed characters (present).
+
+    Matched against the screen with its WHITESPACE NORMALIZED, because every literal here lives
+    in a footer and a footer wraps. Measured on a 46-column pane -- the width a herdr pane really
+    has on this host -- the footer breaks mid-phrase, as "... ctrl+g to" / "edit in Nvim . Esc to
+    cancel" on two lines, and a plain `in` against that finds nothing: the field was open, this
+    returned False, and the relay went on offering option buttons that could only ever type their
+    own label into the reader's answer. Joining on whitespace costs one split and makes the match
+    independent of where the terminal happened to break the line.
+    """
+    flat = " ".join(text.split())
+    return (
+        "Enter your response:" in flat
+        or ("Custom answer:" in flat and "submit" in flat.lower())
+        or "ctrl+g to edit in" in flat.lower()
     )
+
 
 def question_prompt_id(pane_id, content):
     question = detect_question(content)
     if not question:
+        checkbox = detect_checkbox_options(content)
+        if checkbox:
+            # Hash the LABELS ONLY. The whole point of this menu is that a tap flips `[ ]` to
+            # `[✔]` in place, so an id computed over the markers would change on every toggle
+            # and the NEXT toggle would be refused as "question changed" -- the feature would
+            # work exactly once per question. Same reason the two branches below hash labels
+            # rather than the screen.
+            signature = json.dumps(
+                {"pane_id": pane_id, "checkbox": hashable_option_labels(checkbox)},
+                sort_keys=True,
+            )
+            return hashlib.sha256(signature.encode("utf-8")).hexdigest()[:20]
         numbered = detect_numbered_options(content)
         if numbered:
             # A Claude approval/question menu sits inside a live status region -- an elapsed
@@ -1736,16 +2122,45 @@ def question_prompt_id(pane_id, content):
 def prompt_matches(pane_id, prompt_id, remote=None):
     if not prompt_id:
         return False
-    return question_prompt_id(pane_id, read_pane(pane_id, remote=remote)) == prompt_id
+    # question_screen, not read_pane: a menu that has merely scrolled off the viewport is still
+    # the same question, and answering "the question changed" to it sent the reader back to a
+    # card that was already correct.
+    return question_prompt_id(pane_id, question_screen(pane_id, remote=remote)) == prompt_id
 
 
 def blocked_message(pane_id, agent, project, host, content):
     question = detect_question(content) if agent == "omp" else None
     options = detect_options(content) if agent == "omp" else detect_approval_options(content)
     # omp has its own question grammar; everything else falls back to a Claude-style 1..N menu.
-    numbered = agent != "omp" and not options and detect_numbered_options(content)
+    # The checkbox menu is looked for FIRST of those two, because the two overlap in shape and
+    # only this one must not be answered by pressing a number once: a digit here toggles a box,
+    # and nothing is delivered to the agent until Submit. A client that saw it as an ordinary
+    # numbered menu would report the question answered while the agent still sat there blocked.
+    checkbox = [] if agent == "omp" or options else detect_checkbox_options(content)
+    numbered = (
+        agent != "omp" and not options and not checkbox and detect_numbered_options(content)
+    )
     if numbered:
         options = numbered
+    omp_multi = bool(question and question["multi"])
+    multi = omp_multi or bool(checkbox)
+    if checkbox:
+        multi_options = [row["label"] for row in checkbox]
+        selected_options = [row["label"] for row in checkbox if row["checked"]]
+    elif omp_multi:
+        multi_options = options
+        selected_options = [
+            option["label"] for option in question["options"]
+            if option["multi"] and option["label"] != QUESTION_OTHER
+            and "Done selecting" not in option["label"] and option["checked"]
+        ]
+    else:
+        # A question that is not multi has no checked rows to report by construction:
+        # question["multi"] is `any(option["multi"]) or has_done`, so its being false means no
+        # option carries a marker at all. This was the same comprehension as above, spelled out
+        # for a case where it could only ever return [].
+        multi_options = []
+        selected_options = []
     return {
         "type": "blocked",
         "pane_id": pane_id,
@@ -1754,15 +2169,35 @@ def blocked_message(pane_id, agent, project, host, content):
         "host": host,
         "prompt": content[-500:],
         "prompt_id": question_prompt_id(pane_id, content),
-        "options": [] if question and question["multi"] else options,
-        "multi_options": options if question and question["multi"] else [],
-        "selected_options": [
-            option["label"] for option in question["options"]
-            if option["multi"] and option["label"] != QUESTION_OTHER
-            and "Done selecting" not in option["label"] and option["checked"]
-        ] if question else [],
-        "interaction": "omp_question" if question else ("numbered" if numbered else "prompt"),
-        "multi": bool(question and question["multi"]),
+        "options": [] if multi else options,
+        "multi_options": multi_options,
+        "selected_options": selected_options,
+        # "omp_question" is omp's arrow-key grammar and is left exactly as it was. A checkbox
+        # menu is the same PROTOCOL shape -- multi_options, selected_options, question_toggle,
+        # question_submit -- driven by different keys, so it gets its own name rather than
+        # borrowing one that would be a lie on a claude pane. herdi-mac, herdi-ios and herdi-win
+        # switch on `multi` alone and need no change; the web app checks this field and accepts
+        # both.
+        "interaction": (
+            "omp_question" if question
+            else "multi_question" if checkbox
+            else "numbered" if numbered
+            else "prompt"
+        ),
+        # A text field on the pane has focus. The menu is still drawn and still parses -- Claude's
+        # "Type something." turns one of its own rows into an input rather than opening a second
+        # screen -- so nothing else in this message distinguishes the two states, and a client
+        # that draws option buttons here draws buttons that cannot work: the field takes every
+        # digit as a character, and the arrow keys are the only way back to the list. Clients
+        # older than this field ignore it and behave exactly as they did.
+        # A checkbox menu answers this itself (see checkbox_field_focused). Everything else keeps
+        # the footer test, which was verified against all four states of claude's SINGLE-select
+        # menu and is not disturbed here.
+        "text_field": checkbox_field_focused(content) if checkbox else custom_editor_active(content),
+        # What is already typed into the free-text row, so a client can show it and offer to
+        # clear it. Empty for every other kind of prompt.
+        "text_value": free_text_value(content) if checkbox else "",
+        "multi": multi,
         "update": False,
     }
 
@@ -1781,9 +2216,101 @@ def move_question_cursor(pane_id, question, target_index, remote=None):
     return not keys or _mutate_herdr("pane", "send-keys", pane_id, *keys, remote=remote)
 
 
+def toggle_checkbox_option(pane_id, option_label, remote=None):
+    """Flip one row of a numbered checkbox menu by pressing its digit.
+
+    The digit is read off the row rather than counted from the client's list, because the two
+    disagree the moment a menu holds a row the client was not given -- "Chat about this" carries
+    no checkbox and is not an option, but it does carry a number.
+    """
+    content = question_screen(pane_id, remote=remote)
+    # While the input has focus every digit lands in it as a CHARACTER instead of toggling
+    # anything, so refuse rather than type into the reader's answer. The test is focus, not
+    # custom_editor_active: that one goes true as soon as the free-text row is TICKED, which
+    # would have refused every toggle on the menu for the rest of the question.
+    if checkbox_field_focused(content):
+        return False
+    row = next(
+        (
+            row for row in detect_checkbox_options(content)
+            if row["label"].casefold() == option_label.casefold()
+        ),
+        None,
+    )
+    if row is None:
+        return False
+    if row["label"].casefold() in QUESTION_FREE_TEXT_LABELS:
+        # "Type something" is not an answer, it is a request for somewhere to type -- so this row
+        # needs BOTH keys, in this order:
+        #   the digit ticks its box, which is what makes the typed answer count. Measured: with
+        #     the box left clear the row submitted as `[ ] and dark mode please`.
+        #   the cursor walk opens the input. The digit alone leaves the reader with a lit button
+        #     and no text box, and a Send the relay then refused outright.
+        # Tick first, because a digit pressed while the input has focus is typed INTO it. The
+        # cursor does not move on a digit press, so `content` still describes where it is.
+        if not row["checked"] and not _mutate_herdr(
+            "pane", "send-keys", pane_id, str(row["number"]), remote=remote
+        ):
+            return False
+        return focus_menu_row(pane_id, content, row["number"], remote=remote)
+    return _mutate_herdr("pane", "send-keys", pane_id, str(row["number"]), remote=remote)
+
+
+def submit_checkbox_question(pane_id, remote=None):
+    """Deliver a checkbox menu's answer: walk Right to the Submit tab, then press its number.
+
+    Each question in a group is a tab and Submit is the tab past the last of them, so the walk
+    is a loop rather than one keypress. The review screen is an ordinary numbered menu
+    ("1. Submit answers", "2. Cancel") and its number is READ rather than assumed -- it is the
+    one screen where a wrong digit answers Cancel and throws the reader's selection away.
+
+    The checkbox list is what says we have not arrived yet. Checking for "submit" among the
+    numbered labels alone is not enough: the question screen's own "Type something" row has the
+    word Submit on the line beneath it, which detect_numbered_options glues onto that label
+    whenever the options carry no descriptions -- and pressing its number would tick a box and
+    open a text field instead of submitting anything.
+    """
+    for step in range(QUESTION_TAB_LIMIT):
+        content = question_screen(pane_id, remote=remote) if step == 0 else read_pane(
+            pane_id, remote=remote
+        )
+        if checkbox_field_focused(content):
+            # Right inside the input moves the text caret, not the tab -- measured, submitting
+            # from there simply failed. Step the cursor off the row first; Down, because the
+            # free-text row is the last checkbox and Up would walk back into the options.
+            if not _mutate_herdr("pane", "send-keys", pane_id, "Down", remote=remote):
+                return False
+            time.sleep(0.15)
+            continue
+        if any(INLINE_SUBMIT_RE.match(line) for line in content.splitlines()):
+            # Down from the input lands here. Enter opens the review screen, which the next turn
+            # of this loop answers; measured, it carried "Push, Watch, and dark mode please" --
+            # the typed answer among the ticked ones.
+            if not _mutate_herdr("pane", "send-keys", pane_id, "Enter", remote=remote):
+                return False
+            time.sleep(0.3)
+            continue
+        if not detect_checkbox_options(content):
+            index = next(
+                (
+                    position
+                    for position, label in enumerate(detect_numbered_options(content), start=1)
+                    if "submit" in label.casefold()
+                ),
+                None,
+            )
+            if index is None:
+                return False
+            return _mutate_herdr("pane", "send-keys", pane_id, str(index), remote=remote)
+        if not _mutate_herdr("pane", "send-keys", pane_id, "Right", remote=remote):
+            return False
+        time.sleep(0.15)
+    return False
+
+
 def toggle_question_option(pane_id, option_label, remote=None):
     if not pane_is_omp(pane_id, remote=remote):
-        return False
+        return toggle_checkbox_option(pane_id, option_label, remote=remote)
     question = detect_question(read_pane(pane_id, remote=remote))
     if not question or not question["multi"]:
         return False
@@ -1799,7 +2326,7 @@ def toggle_question_option(pane_id, option_label, remote=None):
 
 def submit_multi_question(pane_id, remote=None):
     if not pane_is_omp(pane_id, remote=remote):
-        return False
+        return submit_checkbox_question(pane_id, remote=remote)
     content = read_pane(pane_id, remote=remote)
     question = detect_question(content)
     if not question or not question["multi"]:
@@ -1818,6 +2345,42 @@ def submit_multi_question(pane_id, remote=None):
     ):
         return _mutate_herdr("pane", "send-keys", pane_id, "Tab", "Enter", remote=remote)
     return False
+
+
+def deliver_checkbox_free_text(pane_id, text, remote=None):
+    """Type an answer into a checkbox menu's free-text row, focusing it first if need be.
+
+    Text only lands in that row while the cursor is ON it (focus_menu_row says why), so a client
+    that typed while the cursor sat on row 1 had its sentence applied to the menu as navigation.
+    Focusing here rather than making the client orchestrate it means "type your answer and press
+    Send" works from any state the menu happens to be in.
+    """
+    content = question_screen(pane_id, remote=remote)
+    row = free_text_row(content)
+    if row is None:
+        return False
+    if not row["cursor"]:
+        if not row["checked"] and not _mutate_herdr(
+            "pane", "send-keys", pane_id, str(row["number"]), remote=remote
+        ):
+            return False
+        if not focus_menu_row(pane_id, content, row["number"], remote=remote):
+            return False
+        time.sleep(0.2)
+    # Replace what is there, do not add to it. `pane send-text` appends, so a second Send
+    # concatenated -- measured, "helo" then "XYZ" became "helo XYZ" -- which meant a typo made on
+    # a phone could not be corrected at all: there is no cursor to put in that row from here, and
+    # no way to see it except the mirror. Backspace does reach it (same measurement), so the row
+    # is emptied first and Send means "this is my answer" rather than "append this".
+    current = free_text_value(content)
+    if current and not _mutate_herdr(
+        "pane", "send-keys", pane_id, *(["Backspace"] * len(current)), remote=remote
+    ):
+        return False
+    # No trailing Enter. Enter on this row TOGGLES its checkbox: measured, the answer went in as
+    # `❯ 5. [✔] Type something` -> type -> Enter -> `❯ 5. [ ] and dark mode please`, which is the
+    # text present and the option unselected. The text stays in the row until Submit takes it.
+    return _mutate_herdr("pane", "send-text", pane_id, text, remote=remote)
 
 
 def respond_to_question(pane_id, text, question, remote=None):
@@ -1871,9 +2434,45 @@ async def broadcast(msg):
         log.debug("Removed %d dead client(s)", len(dead))
     clients.difference_update(dead)
 
+async def rebroadcast_blocked(pane_id, remote=None):
+    """Push the pane's question again, now, instead of waiting out the poll.
+
+    A toggle changes one character on screen. The poll would carry it within POLL_INTERVAL, but
+    for that whole window the only thing a client has to show is its own optimistic guess -- and
+    if the toggle FAILED, no update is coming at all: the screen did not change, so the poll's
+    fingerprint is identical and it broadcasts nothing. The button would sit there looking ticked
+    for the rest of the question. Sending the real state straight back makes the card truthful
+    within one round trip either way.
+
+    last_blocked_prompts is updated here too, so _poll_once sees this state as already announced
+    and does not re-fire the web push for it.
+    """
+    cached = agent_cache.get(pane_id, {})
+    content = await asyncio.to_thread(read_pane, pane_id, remote=remote)
+    message = blocked_message(
+        pane_id,
+        cached.get("agent", ""),
+        cached.get("project", ""),
+        cached.get("host", "local"),
+        content,
+    )
+    message["update"] = True
+    last_blocked_prompts[pane_id] = (
+        message["prompt_id"], tuple(message["selected_options"]), message["prompt"],
+    )
+    await broadcast(message)
+
+
 async def send_current_snapshot(ws):
     await ws.send(json.dumps(await asyncio.to_thread(sessions_message)))
     agents, shells = await asyncio.to_thread(get_all_panes)
+    # A pane the poll has already found to be sitting on a question (see probe_idle_questions)
+    # is promoted here too, from the flag rather than by reading again. Without this a client
+    # gets the raw herdr status on connect -- `done` for the very pane that is waiting on it --
+    # and no card until something else changes, which for a question sitting still is never.
+    for a in agents:
+        if question_panes.get((a.get("host", "local"), a["pane_id"])):
+            a["status"] = "blocked"
     update_pane_maps(agents, shells)
     # Force the hierarchy read: a client that just connected has no chip strip at all, and
     # waiting out the slow cadence would show it agents filed under ids for a few seconds.
@@ -1906,9 +2505,59 @@ async def poll_loop():
         await asyncio.sleep(POLL_INTERVAL)
 
 
+def probe_idle_questions(agents):
+    """Screens of the idle panes that are really waiting on a question, as {(host, pane_id): text}.
+
+    One herdr read per pane it decides to look at, so it runs in a worker thread and looks at as
+    few as it can: a pane whose status has just changed (an agent that stops working is exactly
+    when a question appears), one already known to be holding a question, and otherwise the whole
+    idle set once every QUESTION_PROBE_INTERVAL ticks, for panes that were already waiting before
+    this relay started. A pane herdr already calls blocked is left alone -- the branch below
+    handles it -- and a working pane cannot be waiting on anything.
+
+    The screens come back with the answer so the caller can promote and then render from one
+    read rather than two.
+    """
+    global _question_probe_tick
+    if not QUESTION_PROBE:
+        return {}
+    _question_probe_tick += 1
+    sweep = _question_probe_tick % QUESTION_PROBE_INTERVAL == 0
+    found = {}
+    live = set()
+    for a in agents:
+        key = (a.get("host", "local"), a["pane_id"])
+        live.add(key)
+        status = a.get("status", "")
+        changed = question_probe_status.get(key) != status
+        question_probe_status[key] = status
+        if status in QUESTION_PROBE_SKIP_STATUSES:
+            question_panes.pop(key, None)
+            continue
+        if not (changed or question_panes.get(key) or sweep):
+            continue
+        content = read_pane(a["pane_id"], remote=a.get("remote"))
+        if pane_awaiting_answer(content):
+            question_panes[key] = True
+            found[key] = content
+        else:
+            question_panes.pop(key, None)
+    for key in set(question_panes) | set(question_probe_status):
+        if key not in live:
+            question_panes.pop(key, None)
+            question_probe_status.pop(key, None)
+    return found
+
+
 async def _poll_once():
         gen = POLL_GENERATION
         agents, shells = await asyncio.to_thread(get_all_panes)
+        # Before update_pane_maps and before the snapshot, so the activity ledger, the clients and
+        # the blocked branch below all see one status for the pane rather than three.
+        probed = await asyncio.to_thread(probe_idle_questions, agents)
+        for a in agents:
+            if (a.get("host", "local"), a["pane_id"]) in probed:
+                a["status"] = "blocked"
         update_pane_maps(agents, shells)
         # Always broadcast (even empty list) so clients stay in sync
         spaces = await asyncio.to_thread(refresh_spaces)
@@ -1919,7 +2568,11 @@ async def _poll_once():
         for a in agents:
             pid, status = a["pane_id"], a["status"]
             if status == "blocked":
-                content = await asyncio.to_thread(read_pane, pid, remote=a.get("remote"))
+                # The probe has already read a promoted pane; reading it again here would double
+                # the cost of the one case this exists for.
+                content = probed.get((a.get("host", "local"), pid))
+                if content is None:
+                    content = await asyncio.to_thread(read_pane, pid, remote=a.get("remote"))
                 message = blocked_message(
                     pid,
                     a["agent"],
@@ -1944,6 +2597,7 @@ async def _poll_once():
                     # `previous is not None` means "already announced this block".
                     message["update"] = previous is not None
                     last_blocked_prompts[pid] = fingerprint
+                    log.info("Blocked (poll) pane=%s update=%s", pid, message["update"])
                     await broadcast(message)
                     # Clients still need every re-broadcast (the prompt_id they must echo back
                     # to approve moves with the content), but the notification is one-shot.
@@ -1956,10 +2610,20 @@ async def _poll_once():
                     if gen != POLL_GENERATION:
                         return
             else:
-                if last_statuses.get(pid) == "blocked":
-                    await send_web_push("", "", clear=True)
-                    if gen != POLL_GENERATION:
-                        return
+                # No clear push. A subscription is taken out with userVisibleOnly: true, which
+                # is a contract: every push it carries must end in a notification the reader can
+                # see. A clear deliberately shows nothing -- it closes the stale prompt and
+                # returns -- so each one is a broken promise, and Safari answers a run of them by
+                # retiring the subscription outright. Which is invisible from here: the browser's
+                # own getSubscription() starts returning null (the toggle reads Disabled) while
+                # APNs goes on answering 201 for the retired token, so the relay logs deliveries
+                # to a handset that is no longer listening. Measured on this host: four silent
+                # clears, then every later push -- notifications included -- stopped waking the
+                # service worker, with 201 on every one.
+                #
+                # The stale notification is not left forever. It carries tag "herdr-blocked", so
+                # the next block replaces it in place, and tapping it closes it. That is a far
+                # smaller cost than losing the channel.
                 last_blocked_prompts.pop(pid, None)
             last_statuses[pid] = status
 async def event_push():
@@ -2024,12 +2688,29 @@ async def event_push():
             # that inserts an await between this check and the writes below.
             if gen != POLL_GENERATION:
                 continue        # a switch landed; this event is stale
+            # A block announced here is a block the poll will never announce. This path claims
+            # last_blocked_prompts, and _poll_once reads that same dict to decide whether a
+            # blocked pane is new -- so once the event has landed, the poll sees `previous is
+            # not None`, calls it an update and skips the notification, while an unchanged
+            # fingerprint stops it before even that. Either way send_web_push never ran, and
+            # since the plugin's event beats the poll whenever it fires at all, the
+            # notification was lost exactly when the fast path worked. Push here, on the same
+            # one-shot rule the poll uses: announce a new block, stay quiet for a re-broadcast.
+            previous = last_blocked_prompts.get(pane_id)
+            message["update"] = previous is not None
             last_blocked_prompts[pane_id] = (
                 message["prompt_id"],
                 tuple(message["selected_options"]),
                 message["prompt"],
             )
+            log.info("Blocked (event) pane=%s update=%s", pane_id, message["update"])
             await broadcast(message)
+            if not message["update"]:
+                await send_web_push(
+                    title=f"\U0001f411 {agent_data.get('project', '')} blocked",
+                    body=(content or agent_data.get("prompt", ""))[:120],
+                    url=f"/?pane={pane_id}",
+                )
 
 
 WEB_DIR = os.path.realpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "web"))
@@ -2286,30 +2967,52 @@ async def handle_client(ws):
             if msg_type == "question_toggle":
                 pane_id = msg["pane_id"]
                 option = msg.get("option", "")
+                # Every refusal on this path carries `scope` and `option`. A client ticks the
+                # button the moment it is tapped -- it has to, a round trip is too long to leave
+                # a control dead -- so a refusal it cannot attribute leaves that tick standing
+                # over a pane where nothing happened, which is worse than a slow button: the
+                # reader submits an answer believing an option is in it.
+                def toggle_error(message):
+                    return json.dumps({
+                        "type": "error", "message": message,
+                        "scope": "question_toggle", "pane_id": pane_id, "option": option,
+                    })
+
                 if pane_id not in known_panes or not option:
-                    await ws.send(json.dumps({"type": "error", "message": "invalid question option"}))
+                    await ws.send(toggle_error("invalid question option"))
                     continue
                 remote = pane_remote_map.get(pane_id)
                 if not await asyncio.to_thread(
                     prompt_matches, pane_id, msg.get("prompt_id", ""), remote=remote
                 ):
-                    await ws.send(json.dumps({"type": "error", "message": "question changed; refresh and try again"}))
+                    await ws.send(toggle_error("question changed; refresh and try again"))
+                    await rebroadcast_blocked(pane_id, remote=remote)
                     continue
                 if not await asyncio.to_thread(toggle_question_option, pane_id, option, remote=remote):
-                    await ws.send(json.dumps({"type": "error", "message": "question option toggle failed"}))
+                    await ws.send(toggle_error("question option toggle failed"))
+                await rebroadcast_blocked(pane_id, remote=remote)
             elif msg_type == "question_submit":
                 pane_id = msg["pane_id"]
+
+                def submit_error(message):
+                    return json.dumps({
+                        "type": "error", "message": message,
+                        "scope": "question_submit", "pane_id": pane_id,
+                    })
+
                 if pane_id not in known_panes:
-                    await ws.send(json.dumps({"type": "error", "message": "unknown pane_id"}))
+                    await ws.send(submit_error("unknown pane_id"))
                     continue
                 remote = pane_remote_map.get(pane_id)
                 if not await asyncio.to_thread(
                     prompt_matches, pane_id, msg.get("prompt_id", ""), remote=remote
                 ):
-                    await ws.send(json.dumps({"type": "error", "message": "question changed; refresh and try again"}))
+                    await ws.send(submit_error("question changed; refresh and try again"))
+                    await rebroadcast_blocked(pane_id, remote=remote)
                     continue
                 if not await asyncio.to_thread(submit_multi_question, pane_id, remote=remote):
-                    await ws.send(json.dumps({"type": "error", "message": "question submission failed"}))
+                    await ws.send(submit_error("question submission failed"))
+                    await rebroadcast_blocked(pane_id, remote=remote)
             elif msg_type == "respond":
                 pane_id = msg["pane_id"]
                 request_id = msg.get("request_id")
@@ -2347,6 +3050,8 @@ async def handle_client(ws):
                     continue
                 content = await asyncio.to_thread(read_pane, pane_id, remote=remote)
                 if question_prompt_id(pane_id, content) != msg.get("prompt_id", ""):
+                    log.warning("Response refused (stale prompt_id) from %s: pane=%s text=%r",
+                                ip, pane_id, text)
                     await ws.send(json.dumps(command_error("prompt changed; refresh and try again")))
                     continue
                 question = (
@@ -2357,31 +3062,68 @@ async def handle_client(ws):
                 menu_key = None if question else numbered_option_key(
                     text, detect_numbered_options(content)
                 )
-                log.info("Response from %s (%s): pane=%s text=%r", ip, device, pane_id, text)
-                audit("respond", ip, device, pane_id, f"text={text!r}")
+                # Typing into a checkbox menu is always the free-text row; see
+                # deliver_checkbox_free_text. Checked after the numbered menu so a plain "1" on an
+                # ordinary approval still goes out as a key press.
+                checkbox_text = (
+                    not question
+                    and not menu_key
+                    and bool(detect_checkbox_options(content))
+                    and free_text_row_number(content) is not None
+                )
+                # Decided ONCE. The log line and the dispatch below used to evaluate this same
+                # chain separately, so a change to one of them silently made the other lie about
+                # where a reader's text had gone -- and it cost two extra screen scans.
                 if question:
+                    route = "question"
+                elif menu_key and not custom_editor_active(content):
+                    route = "menu"
+                elif checkbox_text:
+                    route = "checkbox-text"
+                elif custom_editor_active(content) or text.lower() in SAFE_RESPONSES:
+                    route = "text"
+                else:
+                    route = "refused"
+                log.info("Response from %s (%s): pane=%s text=%r route=%s", ip, device, pane_id,
+                         text, f"menu:{menu_key}" if route == "menu" else route)
+                audit("respond", ip, device, pane_id, f"text={text!r}")
+                if route == "question":
                     delivered = await asyncio.to_thread(
                         respond_to_question, pane_id, text, question, remote=remote
                     )
-                elif menu_key and not custom_editor_active(content):
+                elif route == "menu":
                     # A numbered menu takes a real key press. Pasting "1" (or "no") through the
                     # send-text branch below would not select anything -- the trailing Enter
                     # lands on whichever option is highlighted, which is "Yes".
                     delivered = await asyncio.to_thread(
                         _mutate_herdr, "pane", "send-keys", pane_id, menu_key, remote=remote
                     )
-                elif custom_editor_active(content) or text.lower() in SAFE_RESPONSES:
+                elif route == "checkbox-text":
+                    delivered = await asyncio.to_thread(
+                        deliver_checkbox_free_text, pane_id, text, remote=remote
+                    )
+                elif route == "text":
                     delivered = await asyncio.to_thread(
                         _mutate_herdr, "pane", "send-text", pane_id, text, remote=remote
                     ) and await asyncio.to_thread(
                         _mutate_herdr, "pane", "send-keys", pane_id, "Enter", remote=remote
                     )
                 else:
+                    # The one branch that silently drops a reader's typed text. Saying so out
+                    # loud is the difference between "the relay refused this" and "my message
+                    # vanished": the client shows a toast the reader has usually scrolled past.
+                    log.warning(
+                        "Response refused (no question detected) from %s: pane=%s text=%r "
+                        "numbered=%d editor=%s",
+                        ip, pane_id, text, len(detect_numbered_options(content)),
+                        custom_editor_active(content),
+                    )
                     await ws.send(json.dumps({
                         **command_error("free-text response requires a detected question"),
                     }))
                     continue
                 if not delivered:
+                    log.warning("Response delivery failed from %s: pane=%s text=%r", ip, pane_id, text)
                     await ws.send(json.dumps(command_error("response delivery failed")))
                     continue
                 response = {"type": "command_result", "command": "respond", "ok": True}

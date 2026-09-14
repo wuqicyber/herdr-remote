@@ -408,9 +408,9 @@ a mis-drag cannot make the panel unreadable, and the dialog is reached from the 
 than from the panel, so nothing set here can lock you out.
 
 **Multi-select is relay-only.** `question_toggle` / `question_submit` are relay-protocol
-messages with no herdr CLI verb behind them, so the checkboxes are inert in direct mode
-rather than pretending to work. Same restriction as macOS, which guards both on
-`mode == .relay`.
+messages with no herdr CLI verb behind them — the relay drives the menu's own keys on the
+client's behalf — so the checkboxes are inert in direct mode rather than pretending to work.
+Same restriction as macOS, which guards both on `mode == .relay`.
 
 ## Protocol constraints this client respects
 
@@ -426,10 +426,14 @@ bound by them:
 - **Interrupt is `C-c`, not `Ctrl+c`.** `SAFE_KEYS` (`herdr_relay.py:91`) lists `C-c`.
   The mac app's `"Ctrl+c"` spelling only works because it talks to the local CLI
   instead of the relay.
-- **`question_toggle` / `question_submit` are unhandled.** The relay has no branch for
-  either message. The web app, TUI, mac and iOS clients all send them and are silently
-  ignored. This client sends them too, for parity, so multi-select starts working the
-  moment the relay grows support — but the checkbox path is inert today.
+- **`question_toggle` / `question_submit` are handled, for two different menus.**
+  `interaction: "omp_question"` is omp's arrow-key question grammar; `"multi_question"` is
+  the numbered checkbox menu every other harness draws (claude's `AskUserQuestion` with
+  `multiSelect`), which the relay drives by pressing a row's own digit and then walking
+  `Right` to its Submit tab. This client needs neither distinction: it binds the checkbox
+  path to `Multi` alone, which is true for both, and sends the option's **label** — the
+  relay maps it back to a key. A stale `PromptId` is refused with *"question changed;
+  refresh and try again"* rather than toggling the wrong row.
 
 ## Why not the Windows App SDK
 

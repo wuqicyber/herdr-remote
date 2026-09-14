@@ -100,6 +100,8 @@ cd herdi-win && ./build.ps1
 | `HERDR_SESSION` | Boot-time default herdr session; a client can override it per source at runtime via `session_switch` |
 | `HERDR_SHELL_PANES` | Set to `1` to list, read and **write** the panes with no agent in them (default off — writing to one is arbitrary command execution; see SECURITY.md) |
 | `HERDR_TRANSCRIPT` | Set to `0` to refuse every `get_history` with `unavailable: "disabled"` |
+| `HERDR_QUESTION_PROBE` | Set to `0` to stop reading idle panes for questions herdr's own detection missed |
+| `HERDR_QUESTION_PROBE_POLLS` | Poll ticks between full sweeps of the idle panes (default 5) |
 | `HERDR_CLAUDE_ROOTS` | Comma-separated roots to search for claude transcripts (default `~/.claude/projects`) |
 | `HERDR_PI_ROOTS` | Comma-separated roots holding pi session logs; a pane's path ref must sit inside one (default `~/.pi/agent/sessions`) |
 | `HERDR_REMOTE_CLAUDE_ROOTS` | Same, as remote shell words (default `$HOME/.claude/projects`) |
@@ -786,7 +788,174 @@ appeared for the people on a tunnel.
 - **`respond` is allowlisted.** Only the 12 values in `SAFE_RESPONSES` (`herdr_relay.py:90`) are accepted; anything else returns `response not in allowlist`. Free-form replies must use `agent_prompt` (≤10000 chars) or `send_text` (≤1000). The mac/iOS approval cards send custom text as `respond`, so their custom-reply box does not work against the relay.
 - **Keys use herdr's `+` grammar, validated by `key_is_allowed`, and `keys` must be a non-empty array.** Bare specials (`Enter` `Escape` `Tab` `Space` `Backspace` `Up`…`F12`), single characters, and `ctrl+`/`shift+`/`alt+` chords all pass — special names case-insensitively, so `esc` and `shift+tab` are fine. `C-c` also passes: live-verified as the one tmux-style spelling herdr 0.8.0 still aliases to interrupt (`C-u`, `M-x`, `BTab` do not). `BSpace`, `Insert` and `Delete` are rejected by herdr in any spelling.
 - **`PageUp`, `PageDown`, `Home` and `End` are sent as bytes, not as keys.** herdr's own validator refuses every spelling of them (re-probed on 0.8.2: `PgUp`, `pageup`, `Page_Up` and `ctrl+Home` all answer `unsupported key`), so `key_escape_sequence` turns them into the CSI bytes a terminal emits and the relay ships that through `pane send-text` instead — `pane send-text` is a byte channel and passes ESC verbatim. Modified forms are computed, not enumerated: xterm's `1 + shift(1) + alt(2) + ctrl(4)`, so `ctrl+Home` is `ESC[1;5H` and `shift+PageUp` is `ESC[5;2~`. A mixed `keys` array keeps its order — consecutive keys of one kind travel in one CLI call, so `[Escape, PageUp, PageDown, Enter]` becomes send-keys / send-text / send-keys, in that order. Clients still just send the key name.
-- **`question_toggle`/`question_submit` have no relay handler.** The web app, TUI, mac and iOS clients all send them; the relay ignores both, so multi-select questions cannot be answered from any client until it grows support.
+- **`question_toggle`/`question_submit` drive a checkbox list, and `interaction` says with which
+  keys.** Both have handlers (`herdr_relay.py`), both take `{pane_id, prompt_id, option?}`, and
+  both are refused with `question changed; refresh and try again` when the `prompt_id` no longer
+  matches the screen. Two menus reach clients in this shape:
+  - `interaction: "omp_question"` — omp's own question grammar, driven by moving its cursor
+    (`Down`×n, `Enter`) and submitted on its `Done selecting` row.
+  - `interaction: "multi_question"` — **the numbered checkbox menu every other harness draws**
+    (Claude's `AskUserQuestion` with `multiSelect`). Live-probed on claude 2.1.269 / herdr 0.9.0:
+    a row's **digit** toggles its own box and leaves the menu up, and `Right` walks to a Submit
+    tab that is an ordinary numbered menu (`1. Submit answers`, `2. Cancel`). Digits are
+    absolute, so no cursor arithmetic is involved.
+
+  A client needs none of that: it renders `multi_options` / `selected_options` and sends a label.
+  `herdi-mac`, `herdi-ios` and `herdi-win` switch on `multi` alone and needed no change; the web
+  app and the TUI check `interaction` and accept both values.
+
+  Three things about this are load-bearing, and each was its own bug:
+  - **`detect_numbered_options` cannot see a checkbox menu at all.** Every option carries a
+    description line indented to *exactly* the number column — `[ ] ` shifts the label right,
+    so the description lands where the digits are rather than past them — and that is neither
+    the next number nor a deeper-indented continuation, so the run resets on the first
+    description and never reaches the two options a menu needs. Measured against a live pane it
+    returns `[]`, which is why a multi-select question reached **every** client as
+    `interaction: "prompt"` with no options and nothing to tap. `detect_checkbox_options` is a
+    separate detector rather than a widening of that rule, which is what keeps the single-select
+    and approval menus — whose rows carry no `[ ]` — byte-identical.
+  - **Every reader of the menu goes through `checkbox_rows`.** It returns the last contiguous
+    run, the way `detect_numbered_options` does, and the options, the free-text row, its value
+    and the focus test are all derived from that one list. Three of them used to take `max()`
+    over the whole screen instead, so an agent that had printed its own numbered checklist above
+    the question pointed them at a row of the *checklist*: measured on such a screen the options
+    read 1..3 correctly while the free-text row read 7, typing mode was never detected, and the
+    reader's text was walked six rows down a four-row menu before being sent.
+  - **The `prompt_id` hashes the labels, never the markers.** A tap flips `[ ]` to `[✔]` *in
+    place*; an id computed over the screen would move on every toggle and the **second** tap
+    would be refused as stale, so the feature would work exactly once per question.
+  - **Submit reads the review screen's number instead of assuming it.** It is the one screen
+    where a wrong digit answers `Cancel` and throws the selection away. The checkbox list is
+    what says the walk has not arrived yet: when the options carry no descriptions
+    `detect_numbered_options` *can* read the menu, and it glues the `Submit` line beneath
+    `Type something` onto that row — so looking for the word alone would press that row's digit
+    and open a text field.
+
+  **`respond` is still the wrong message for one of these.** A digit here toggles; nothing
+  reaches the agent until Submit, so `options` is sent empty and a client that fell through to
+  the plain-options branch would report an answer the agent never received.
+
+  Three more, all found by a reader actually using it on a phone and all of them failures that
+  looked like success:
+  - **A `--source visible` read does not see a menu claude has scrolled off its own viewport.**
+    New output above the question pushes it below the fold and claude draws
+    `1 new message (ctrl+End)` where the footer was. Every handler then read that screen as "the
+    question is gone": measured, toggling Push, Widgets and Telegram on a scrolled pane all
+    returned False and changed nothing, and the same three succeeded once it was at the bottom.
+    `question_screen` now sends claude's own ctrl+End — as CSI bytes, since herdr's validator
+    refuses every spelling of End — and re-reads, but only when the menu is missing *and*
+    `pane_scrolled_away` says why. `prompt_matches` goes through it too: a menu that merely
+    scrolled away is still the same question, and answering `question changed` to it sent the
+    reader back to a card that was already correct.
+  - **The free-text row being TICKED is not the input having focus.** `custom_editor_active`
+    reads the footer gaining `ctrl+g to edit in <editor>`, which is true of claude's single-select
+    menu — where it was verified — but on a checkbox menu that footer appears the moment the row
+    is ticked and stays while the cursor sits anywhere else. So one tap on `Type something` put
+    every client into its text-only branch **for the rest of the question**: all four checkboxes
+    and the Submit button gone, no way back, and the relay refusing every further toggle. The
+    checkbox path now asks `checkbox_field_focused`, which is the cursor being on the **last**
+    checkbox row — claude puts the free-text row under the real options, and reading that row's
+    *label* does not work because it is empty only until the first keystroke.
+  - **A refusal must be attributable.** Clients tick a button the instant it is tapped, because a
+    round trip is too long to leave a control dead, and the web app's only reaction to an `error`
+    was a sound cue. A refused toggle therefore left the tick standing over a pane where nothing
+    had happened — and no correction was coming, because the screen had not changed and the
+    poll's fingerprint was identical, so no `blocked` re-broadcast fired. The reader submitted an
+    answer believing an option was in it. Refusals on this path now carry `scope`, `pane_id` and
+    `option`, and **every toggle — and every refusal of either message — re-broadcasts the pane's
+    real state immediately** (`rebroadcast_blocked`) rather than waiting out `POLL_INTERVAL` —
+    which also updates `last_blocked_prompts`, so the poll does not re-fire the web push for it.
+    A *successful* `question_submit` is the one outcome that does not: the question is over, and
+    re-drawing its dock is the thing `clearDockIfAnswered` exists to undo.
+
+  **"Type something" is four keys, not one, and every one of them was wrong to omit.** It is the
+  menu's free-text row, and a client taps it like any other option — but it is a request for
+  somewhere to type, not an answer. Measured, one step at a time:
+  - **Its digit only ticks the box.** The cursor stayed on row 1, no input opened,
+    `custom_editor_active` was False — the reader got a lit button, no text box, and a Send the
+    relay then refused outright with *"free-text response requires a detected question"*.
+  - **The input opens when the CURSOR reaches the row**, so `focus_menu_row` walks it there.
+  - **The tick still matters**, and it has to come first: with the box left clear the row
+    submitted as `[ ] and dark mode please`, and a digit pressed once the input has focus is
+    typed *into* it. The cursor does not move on a digit press, so one read serves both keys.
+  - **No Enter after the text.** Enter on this row toggles its checkbox:
+    `[✔] Type something` → type → Enter → `[ ] and dark mode please`, the answer present and the
+    option unselected. The text sits in the row until Submit takes it.
+  - **Submit cannot start from inside the input** — `Right` there moves the text caret, not the
+    tab, and submitting simply failed. `Down` steps off onto the menu's own `Submit` line
+    (`INLINE_SUBMIT_RE`, which carries no number), and Enter there opens the same review screen
+    the tab walk reaches. Verified end to end: the agent recorded *"Push, Watch, plus the
+    write-in dark mode"*.
+
+  **The dock's lifetime is the pane's status, not the message that built it.** `openTerminal`
+  builds the approval dock and is only re-entered on a `blocked` message, so nothing emptied it
+  when the pane stopped being blocked: pressing Submit left the option buttons standing over a
+  question already answered, and so did answering at the desk or from another client. `respond`
+  cleared the dock itself, which covered its own path and hid the gap for every other one.
+  `clearDockIfAnswered` now runs from `render()` — every snapshot — and `submitQuestion` clears
+  optimistically the way `respond` does, since the round trip is long enough to invite a second
+  press. Measured: the pane leaves `blocked` **0.5s** after a submit, so the snapshot that clears
+  it arrives well inside one poll.
+
+  **Submit is drawn in typing mode too.** It was only on the options branch, so typing an answer
+  took the one control that finishes the question off the screen — the reader was left holding a
+  typed reply and no way to send it. The relay steps the cursor off the input itself, so it is
+  the same button — and because it is, the refusal notice is drawn in both branches too
+  (`questionErrorHint`). Drawing it only beside the options would have left the one control this
+  paragraph adds able to fail with nothing but a sound behind it.
+
+  **Send REPLACES the row, it does not add to it.** `pane send-text` appends — measured, "helo"
+  then "XYZ" became "helo XYZ" — so a typo made on a phone could not be corrected at all: there
+  is no cursor to place in that row from a client, and no way to see it except the mirror.
+  Backspace does reach it (same measurement), so the row is emptied before the new text goes in
+  and Send means "this is my answer". The card carries `text_value`, what is already typed, for
+  two reasons: a reply box that silently overwrites something the reader cannot see is its own
+  trap, and emptying the row is the one edit Send cannot express — an empty message sends
+  nothing — so the web app's `Clear` sends `Backspace` × that length through plain `send_keys`.
+
+  `deliver_checkbox_free_text` does all of it server-side, so a client only has to send the text
+  — "type your answer and press Send" works from whatever state the menu happens to be in.
+
+  **The relay decides for itself that a pane is waiting**, because herdr's own detection misses
+  this at narrow widths. herdr reads `blocked` off the dialog's footer: `live_blocked_form`
+  (priority 980) needs `esc to cancel` as a literal after the last horizontal rule, and claude's
+  question footer — `Enter to select · ↑/↓ to navigate · Esc to cancel`, **49 cells** — wraps
+  below that and splits the literal across two lines. Detection falls through to
+  `live_prompt_box` (950, **idle**). Measured on one pane and one question: **103 columns →
+  `blocked`, 46 columns → `idle`**. The control is claude's own trust dialog — footer 32 cells,
+  no wrap — which herdr reports blocked at 46 columns.
+
+  A pane's width is not a setting; it follows whatever terminal is attached, so **connecting to
+  the host from a phone shrinks every pane to the handset's width**. The question was therefore
+  least likely to be noticed in exactly the situation where a remote client is the only way to
+  answer it. Hence:
+
+  - **A live question owns the bottom of its pane; a picture of one does not.**
+    `question_footer_at_bottom` is checked first and is the only thing separating the two — shape
+    never was, since the same rows read identically either way. Without it a pane merely
+    *displaying* a menu (an agent that printed one, a transcript read back, the session testing
+    this feature) was promoted to `blocked` and served **another pane's option list**, and the
+    checkbox dock then replaced the reply box, so the reader could not type to the agent whose
+    pane it actually was. Reported from the phone and reproduced exactly: the live menu and the
+    same menu with a composer under it both answered True.
+  - `pane_awaiting_answer` matches on **whitespace-normalised** text — it is the wrap, not the
+    words, that herdr's rule loses — and a checkbox menu short-circuits it, since `N. [ ] Label`
+    twice over is an AskUserQuestion and nothing else.
+  - `probe_idle_questions` reads as few panes as it can, because every read is a herdr call and an
+    SSH round trip on a remote host: a pane whose **status just changed** (an agent that stops
+    working is exactly when a question appears), one already **known** to hold a question (its
+    screen is what the card renders from, so it may not go stale), and otherwise the whole set
+    once every `QUESTION_PROBE_INTERVAL` ticks, for panes already waiting when the relay started.
+    The poll hands the screen it read to the blocked branch rather than reading twice.
+  - **The skipped statuses are named, not the allowed ones** — `working` (the agent is running)
+    and `blocked` (already handled). `done` is not a curiosity: `pane list` reports **`done`** for
+    the very pane this was built for, while `agent explain` says `idle` about the same pane at the
+    same moment, and it is `pane list` the relay ships.
+  - `send_current_snapshot` promotes from the flag the poll already set, without reading again.
+    Without it a connecting client got the raw herdr status — `done` for the pane waiting on it —
+    and no card until something changed, which for a question sitting still is never.
+  - `HERDR_QUESTION_PROBE=0` turns it off and takes herdr's status at face value.
+
 - **Workspace and tab ids are only unique within one host.** Every herdr numbers its own spaces
   w1, w2, … so a client that watches more than one host must send `host` alongside
   `workspace_id`/`tab_id`. `resolve_space` serves an id with no host while it is unambiguous and

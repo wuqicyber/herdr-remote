@@ -63,6 +63,7 @@ function render() {
   // path a snapshot arrives by. Cheap: two arrays already in hand, at most eight chips. After the
   // name maps, not before, because the tabs row is named out of the same hierarchy they are.
   renderSiblings();
+  clearDockIfAnswered();
   // A space selection is only reachable while the strip that offers it is up, and the strip is up
   // exactly when the panes span more than one space.
   const occupied = new Set([...agents, ...shellPanes]

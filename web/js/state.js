@@ -1,5 +1,15 @@
 
 let ws = null, agents = [], activePane = null, refreshInterval = null, userScrolledUp = false;
+// The last question_toggle / question_submit the relay refused, as {pane_id, option, message, at}.
+// A refusal used to be a sound and nothing else, which is unreadable on a phone in a pocket: the
+// button stayed ticked over a pane where nothing had happened. Rendered by the session dock for
+// QUESTION_ERROR_MS, then it ages out on its own -- no clearing to forget.
+let questionError = null;
+const QUESTION_ERROR_MS = 8000;
+// The pane whose free-text row we have already pulled the keyboard up for. The dock is rebuilt
+// from every blocked broadcast, so focusing on each rebuild would re-open the keyboard under the
+// reader's thumb; focusing on the TRANSITION into typing gives them the one they asked for.
+let textFieldFocusedFor = null;
 // The panes with no agent in them, from the relay's `panes` array. Empty unless the relay was
 // started with HERDR_SHELL_PANES -- a client cannot tell "switched off" from "none here", and
 // does not need to: both mean there is nothing to show.
@@ -286,7 +296,9 @@ function connect() {
   if (token) wsUrl += (url.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(token);
   const sock = new WebSocket(wsUrl);
   ws = sock;
-  sock.onopen = () => { if (ws !== sock) return; setStatus('connected'); if(window.cue) cue('ready'); };
+  sock.onopen = () => { if (ws !== sock) return; setStatus('connected'); if(window.cue) cue('ready');
+    // Push: the relay's copy of this device's subscription can be stale (see push.js).
+    if (typeof resyncPushSubscription === 'function') resyncPushSubscription(); };
   sock.onclose = () => { if (ws !== sock) return; setStatus('disconnected'); scheduleReconnect(); };
   sock.onerror = () => { if (ws !== sock) return; setStatus('disconnected'); };
   sock.onmessage = (e) => { if (ws !== sock) return; handleMessage(JSON.parse(e.data)); };

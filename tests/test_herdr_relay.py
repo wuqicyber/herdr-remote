@@ -818,26 +818,32 @@ class RelaySessionSwitchTests(unittest.TestCase):
             # The switch must stop the poll before it re-seeds a second pane.
             self.assertEqual(relay.last_blocked_prompts, {})
 
-    def test_stale_poll_bails_after_clear_push_without_restoring_status(self):
-        # last_statuses[pid] == "blocked" pre-set so the poll takes the
-        # clear-push branch; the switch lands during send_web_push. Without
-        # the post-push generation check, the trailing `last_statuses[pid] =
-        # status` line would restore an entry the reset just cleared.
+    def test_leaving_blocked_sends_no_push(self):
+        # A subscription is taken out with userVisibleOnly: true, which is a contract: every
+        # push it carries has to end in a notification the reader can see. The clear push
+        # deliberately showed nothing -- it closed the stale prompt and returned -- so each one
+        # was a broken promise, and Safari answers a run of them by retiring the subscription.
+        # Nothing about that is visible from the relay: getSubscription() starts returning null
+        # on the handset while APNs goes on answering 201, so the log records deliveries to a
+        # device that is no longer listening. Leaving blocked must therefore be silent on the
+        # push channel; the stale notification is replaced in place by the next block, which
+        # shares its tag.
         with loaded_relay() as relay:
             relay.last_statuses["w1:p1"] = "blocked"
+            relay.last_blocked_prompts["w1:p1"] = ("p1", (), "Deploy?")
             agents = [{"pane_id": "w1:p1", "agent": "claude", "status": "idle",
                        "cwd": "/tmp/x", "project": "x", "host": "local", "remote": None}]
 
-            async def switch_mid_clear_push(*args, **kwargs):
-                relay.reset_pane_state()          # simulates a switch landing
-
+            push = mock.AsyncMock()
             with mock.patch.object(relay, "get_all_panes", return_value=(agents, [])), \
                  mock.patch.object(relay, "broadcast", new=mock.AsyncMock()), \
-                 mock.patch.object(relay, "send_web_push", side_effect=switch_mid_clear_push):
+                 mock.patch.object(relay, "send_web_push", new=push):
                 asyncio.run(relay._poll_once())
 
-            # The switch must stop the poll from restoring last_statuses.
-            self.assertEqual(relay.last_statuses, {})
+            push.assert_not_awaited()
+            # The prompt is still forgotten, so the next block counts as new and does notify.
+            self.assertNotIn("w1:p1", relay.last_blocked_prompts)
+            self.assertEqual(relay.last_statuses, {"w1:p1": "idle"})
 
     def test_stale_event_does_not_reseed_blocked_prompt_after_switch(self):
         # A queued agent_event that is already in hand (past reset's queue
@@ -877,6 +883,48 @@ class RelaySessionSwitchTests(unittest.TestCase):
             asyncio.run(run_one_event())
 
             self.assertEqual(relay.last_blocked_prompts, {})
+
+    def test_event_path_notifies_a_new_block_once(self):
+        # The plugin's event beats the poll whenever it fires at all, and this path claims
+        # last_blocked_prompts -- which is the same dict _poll_once reads to decide whether a
+        # blocked pane is new. So a block announced here was a block the poll then called an
+        # update and skipped the notification for, or skipped entirely on an unchanged
+        # fingerprint: send_web_push never ran, and the notification was lost exactly when the
+        # fast path worked. It must notify here, on the poll's own one-shot rule.
+        with loaded_relay() as relay:
+            event = {
+                "type": "agent_event",
+                "pane_id": "w1:p1",
+                "agent": "claude",
+                "status": "blocked",
+                "cwd": "/tmp/x",
+                "project": "x",
+                "host": "local",
+            }
+            push = mock.AsyncMock()
+
+            async def run_events(count):
+                with mock.patch.object(relay, "get_all_panes", return_value=([], [])), \
+                     mock.patch.object(relay, "read_pane", return_value="Deploy to prod?"), \
+                     mock.patch.object(relay, "broadcast", new=mock.AsyncMock()), \
+                     mock.patch.object(relay, "send_web_push", new=push):
+                    task = asyncio.create_task(relay.event_push())
+                    try:
+                        for _ in range(count):
+                            await relay.event_queue.put(dict(event))
+                            # event_push never calls task_done(), so the queue cannot be
+                            # joined; give the task a turn to drain instead.
+                            await asyncio.sleep(0.05)
+                    finally:
+                        task.cancel()
+                        with self.assertRaises(asyncio.CancelledError):
+                            await task
+
+            asyncio.run(run_events(2))
+
+            # One notification for the block; the re-broadcast is an update and stays quiet.
+            self.assertEqual(push.await_count, 1)
+            self.assertIn("w1:p1", relay.last_blocked_prompts)
 
     def test_reset_pane_state_drains_queued_events(self):
         # An event queued before a switch (never dequeued by event_push)
@@ -1987,6 +2035,8 @@ class RelayEventPushTests(unittest.IsolatedAsyncioTestCase):
                             "multi_options": [],
                             "selected_options": [],
                             "interaction": "prompt",
+                            "text_field": False,
+                            "text_value": "",
                             "multi": False,
                             "update": False,
                         },
@@ -3047,8 +3097,84 @@ CLAUDE_MENU = """\
 """
 
 
+# A question menu, as Claude draws one: each answer's description on its own indented line,
+# and a rule between the answers it was given and the two it always appends.
+CLAUDE_QUESTION_MENU = """\
+ Which way?
+
+ ❯ 1. First
+     the first one
+   2. Second
+     the second one
+   3. Type something.
+────────────────────────────────────────
+   4. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to cancel
+"""
+
+# The same screen with "Type something." chosen. Nothing moves except the cursor and the footer:
+# the menu is still there, still parses, and the chosen row is now an inline input.
+CLAUDE_QUESTION_FIELD = CLAUDE_QUESTION_MENU.replace(
+    "Enter to select · ↑/↓ to navigate · Esc to cancel",
+    "Enter to select · ↑/↓ to navigate · ctrl+g to edit in Nvim · Esc to cancel",
+)
+
+
 class ClaudeNumberedMenuTests(unittest.TestCase):
     """Claude Code approval/question menus carry no Codex wording; they are 1..N key menus."""
+
+    def test_a_rule_between_options_does_not_end_the_menu(self):
+        # Claude puts one between the answers it was given and the two it always appends, at
+        # column 0 -- neither the next number nor a deeper-indented continuation, so it ended the
+        # run and took every option below it with it. On a question menu that is the last option,
+        # which no client could then reach.
+        with loaded_relay() as relay:
+            options = relay.detect_numbered_options(CLAUDE_QUESTION_MENU)
+            self.assertEqual(len(options), 4)
+            self.assertEqual(options[-1], "Chat about this")
+            self.assertEqual(relay.numbered_option_key("Chat about this", options), "4")
+
+    def test_the_inline_text_field_is_detected_from_the_footer(self):
+        # "Type something." is not a second screen: the menu stays on display and that row
+        # becomes an input, so the option list parses identically either way. The footer is the
+        # only thing that differs.
+        with loaded_relay() as relay:
+            self.assertFalse(relay.custom_editor_active(CLAUDE_QUESTION_MENU))
+            self.assertTrue(relay.custom_editor_active(CLAUDE_QUESTION_FIELD))
+            self.assertEqual(
+                relay.detect_numbered_options(CLAUDE_QUESTION_FIELD),
+                relay.detect_numbered_options(CLAUDE_QUESTION_MENU),
+            )
+
+    def test_text_typed_into_a_focused_field_still_matches_an_option(self):
+        # Which is exactly why the key press has to be gated on the field NOT having focus: a
+        # digit matches its own option, and a sentence matches an option whose label it equals.
+        # Sent as keys, both land in the field as characters and the menu never closes -- "3"
+        # then "33" on the second attempt.
+        with loaded_relay() as relay:
+            options = relay.detect_numbered_options(CLAUDE_QUESTION_FIELD)
+            self.assertEqual(relay.numbered_option_key("3", options), "3")
+            self.assertEqual(relay.numbered_option_key("Second the second one", options), "2")
+            self.assertTrue(relay.custom_editor_active(CLAUDE_QUESTION_FIELD))
+
+    def test_blocked_message_reports_a_focused_text_field(self):
+        # Nothing else in the message distinguishes the two states: the menu is still drawn and
+        # still parses, so a client has no way to know its option buttons have stopped working.
+        with loaded_relay() as relay:
+            menu = relay.blocked_message("w1:p1", "claude", "x", "local", CLAUDE_QUESTION_MENU)
+            field = relay.blocked_message("w1:p1", "claude", "x", "local", CLAUDE_QUESTION_FIELD)
+            self.assertFalse(menu["text_field"])
+            self.assertTrue(field["text_field"])
+            # ...and the options are identical either way, which is the point.
+            self.assertEqual(menu["options"], field["options"])
+
+    def test_a_rule_does_not_glue_unrelated_numbering_together(self):
+        # The skip only steps over the divider; a run still ends at the first line that is
+        # genuinely neither the next number nor a continuation.
+        with loaded_relay() as relay:
+            screen = "1. a\n2. b\n\u2500\u2500\u2500\u2500\u2500\u2500\nnot a menu line\n4. d\n"
+            self.assertEqual(relay.detect_numbered_options(screen), ["a", "b"])
 
     def test_detects_menu_and_joins_wrapped_option(self):
         with loaded_relay() as relay:
@@ -3206,6 +3332,799 @@ class NumberedMenuPromptIdStabilityTests(unittest.TestCase):
             a = relay.question_prompt_id("pane-1", "just some output\nworking 3s")
             b = relay.question_prompt_id("pane-1", "just some output\nworking 6s")
             self.assertNotEqual(a, b)  # no menu -> old full-content behaviour, still churns
+
+
+class ClaudeMultiSelectMenuTests(unittest.TestCase):
+    """Claude's AskUserQuestion(multiSelect) menu, captured verbatim off a live pane.
+
+    Probed on claude 2.1.269 / herdr 0.9.0. Every screen below is what read_pane() actually
+    returned; the key grammar under them was driven by hand against the same pane, and the agent
+    recorded the answer ("User answered Claude's questions: Which capabilities? -> Nerd Font,
+    Sound") for exactly the rows these tests toggle.
+    """
+
+    # The description line under each option is indented to the SAME column as the numbers --
+    # that is the whole reason detect_numbered_options() cannot see this menu.
+    MENU = """←  ☐ Caps  ✔ Submit  →
+Which capabilities?
+❯ 1. [ ] Color output
+  Use ANSI colors in rendered output.
+  2. [ ] Nerd Font
+  Assume a Nerd Font is installed and use its
+  glyphs/icons.
+  3. [ ] Mobile layout
+  Render a narrow, mobile-friendly layout.
+  4. [ ] Sound
+  Enable audio feedback / notification sounds.
+  5. [ ] Type something
+     Submit
+  6. Chat about this
+Enter to select · ↑/↓ to navigate · Esc to
+cancel"""
+
+    MENU_TWO_TICKED = MENU.replace("2. [ ] Nerd Font", "2. [✔] Nerd Font").replace(
+        "4. [ ] Sound", "4. [✔] Sound"
+    ).replace("☐ Caps", "☒ Caps")
+
+    REVIEW = """←  ☒ Caps  ✔ Submit  →
+Review your answers
+ ● Which capabilities?
+   → Nerd Font, Sound
+Ready to submit your answers?
+❯ 1. Submit answers
+  2. Cancel"""
+
+    # Same menu with the descriptions gone. detect_numbered_options() CAN read this one, and it
+    # glues the "Submit" line onto row 5 -- "[ ] Type something Submit". A submit that looked for
+    # the word "submit" among numbered labels would press 5 here and tick a box.
+    MENU_NO_DESCRIPTIONS = """←  ☐ Caps  ✔ Submit  →
+Which capabilities?
+❯ 1. [ ] Color output
+  2. [ ] Nerd Font
+  3. [ ] Mobile layout
+  4. [ ] Sound
+  5. [ ] Type something
+     Submit
+  6. Chat about this"""
+
+    # Single-select: no checkbox on any row, and the descriptions are indented PAST the numbers
+    # because no "[ ] " shifts the label right. The plain numbered path owns this one.
+    SINGLE_SELECT = """ ☐ Theme
+Which theme?
+❯ 1. Dark
+     Always use the dark color scheme.
+  2. Light
+     Always use the light color scheme.
+  3. Auto
+     Follow the system/terminal theme setting.
+  4. Type something.
+  5. Chat about this
+Enter to select · ↑/↓ to navigate · Esc to
+cancel"""
+
+    def test_the_menu_detect_numbered_options_cannot_see_is_the_one_this_detector_reads(self):
+        with loaded_relay() as relay:
+            self.assertEqual(relay.detect_numbered_options(self.MENU), [])
+            self.assertEqual(
+                [(row["number"], row["label"], row["checked"])
+                 for row in relay.detect_checkbox_options(self.MENU)],
+                [
+                    (1, "Color output", False),
+                    (2, "Nerd Font", False),
+                    (3, "Mobile layout", False),
+                    (4, "Sound", False),
+                    (5, "Type something", False),
+                ],
+            )
+
+    def test_a_multi_select_menu_reaches_clients_as_a_multi_question(self):
+        with loaded_relay() as relay:
+            message = relay.blocked_message("pane-1", "claude", "project", "local", self.MENU)
+
+            self.assertEqual(message["interaction"], "multi_question")
+            self.assertTrue(message["multi"])
+            self.assertEqual(
+                message["multi_options"],
+                ["Color output", "Nerd Font", "Mobile layout", "Sound", "Type something"],
+            )
+            self.assertEqual(message["selected_options"], [])
+            # Options are empty for the same reason omp's multi question empties them: a tap on
+            # one of these does NOT answer the question.
+            self.assertEqual(message["options"], [])
+
+    def test_ticked_rows_come_back_as_the_selection(self):
+        with loaded_relay() as relay:
+            message = relay.blocked_message(
+                "pane-1", "claude", "project", "local", self.MENU_TWO_TICKED
+            )
+
+            self.assertEqual(message["selected_options"], ["Nerd Font", "Sound"])
+
+    def test_a_toggle_does_not_move_the_prompt_id(self):
+        """Otherwise the feature works exactly once: the second tap is refused as stale."""
+        with loaded_relay() as relay:
+            self.assertEqual(
+                relay.question_prompt_id("pane-1", self.MENU),
+                relay.question_prompt_id("pane-1", self.MENU_TWO_TICKED),
+            )
+
+    def test_a_different_question_still_gets_a_different_prompt_id(self):
+        with loaded_relay() as relay:
+            other = self.MENU.replace("Sound", "Telemetry")
+            self.assertNotEqual(
+                relay.question_prompt_id("pane-1", self.MENU),
+                relay.question_prompt_id("pane-1", other),
+            )
+
+    def test_toggling_presses_the_rows_own_digit(self):
+        with loaded_relay() as relay:
+            with mock.patch.object(relay, "pane_is_omp", return_value=False), \
+                 mock.patch.object(relay, "read_pane", return_value=self.MENU), \
+                 mock.patch.object(relay, "_mutate_herdr", return_value=True) as mutate:
+                self.assertTrue(relay.toggle_question_option("pane-1", "Nerd Font"))
+
+            mutate.assert_called_once_with("pane", "send-keys", "pane-1", "2", remote=None)
+
+    def test_the_digit_is_the_rows_number_not_its_position_in_the_clients_list(self):
+        """"Chat about this" carries a number and no checkbox, so the two lists diverge."""
+        with loaded_relay() as relay:
+            with mock.patch.object(relay, "pane_is_omp", return_value=False), \
+                 mock.patch.object(relay, "read_pane", return_value=self.MENU), \
+                 mock.patch.object(relay, "_mutate_herdr", return_value=True) as mutate:
+                relay.toggle_question_option("pane-1", "Sound")
+
+            mutate.assert_called_once_with("pane", "send-keys", "pane-1", "4", remote=None)
+
+    def test_an_option_that_is_not_on_screen_is_refused(self):
+        with loaded_relay() as relay:
+            with mock.patch.object(relay, "pane_is_omp", return_value=False), \
+                 mock.patch.object(relay, "read_pane", return_value=self.MENU), \
+                 mock.patch.object(relay, "_mutate_herdr") as mutate:
+                self.assertFalse(relay.toggle_question_option("pane-1", "Telemetry"))
+
+            mutate.assert_not_called()
+
+    def test_a_ctrl_g_footer_alone_does_not_refuse_a_toggle(self):
+        """This test used to assert the opposite, and the opposite was the bug.
+
+        The footer gains "ctrl+g to edit in <editor>" as soon as the free-text row is TICKED and
+        keeps it while the cursor is elsewhere, so treating it as "the input has focus" refused
+        every toggle for the rest of the question and emptied the dock. Focus is the cursor's
+        position; see test_a_toggle_is_refused_only_while_the_input_has_focus for the real one.
+        """
+        ticked = self.MENU + "\nctrl+g to edit in vim"
+        with loaded_relay() as relay:
+            self.assertTrue(relay.custom_editor_active(ticked))
+            self.assertFalse(relay.checkbox_field_focused(ticked))
+            with mock.patch.object(relay, "pane_is_omp", return_value=False), \
+                 mock.patch.object(relay, "read_pane", return_value=ticked), \
+                 mock.patch.object(relay, "_mutate_herdr", return_value=True) as mutate:
+                self.assertTrue(relay.toggle_question_option("pane-1", "Nerd Font"))
+
+            mutate.assert_called_once_with("pane", "send-keys", "pane-1", "2", remote=None)
+
+    def test_submit_walks_right_to_the_review_and_reads_its_number(self):
+        with loaded_relay() as relay:
+            with mock.patch.object(relay, "pane_is_omp", return_value=False), \
+                 mock.patch.object(
+                     relay, "read_pane", side_effect=[self.MENU_TWO_TICKED, self.REVIEW]
+                 ), mock.patch.object(relay, "_mutate_herdr", return_value=True) as mutate:
+                self.assertTrue(relay.submit_multi_question("pane-1"))
+
+            self.assertEqual(
+                mutate.call_args_list,
+                [
+                    mock.call("pane", "send-keys", "pane-1", "Right", remote=None),
+                    mock.call("pane", "send-keys", "pane-1", "1", remote=None),
+                ],
+            )
+
+    def test_submit_never_presses_the_type_something_row(self):
+        """The word "Submit" appears inside the menu itself once descriptions are absent."""
+        with loaded_relay() as relay:
+            screens = [self.MENU_NO_DESCRIPTIONS] * relay.QUESTION_TAB_LIMIT
+            with mock.patch.object(relay, "pane_is_omp", return_value=False), \
+                 mock.patch.object(relay, "read_pane", side_effect=screens), \
+                 mock.patch.object(relay, "_mutate_herdr", return_value=True) as mutate:
+                self.assertFalse(relay.submit_multi_question("pane-1"))
+
+            pressed = {call.args[3] for call in mutate.call_args_list}
+            self.assertEqual(pressed, {"Right"})
+
+    # Captured off a live 46-column pane with the "Type something" row selected. The footer that
+    # says the field has focus is BROKEN ACROSS TWO LINES at this width, which is the whole point.
+    TYPING = """←  ☒ Feat  ✔ Submit  →
+Which features?
+  1. [ ] Push
+  Push notifications
+  2. [ ] Widgets
+  Home screen widgets
+  3. [ ] Telegram
+  Telegram integration
+  4. [ ] Watch
+  Watch app support
+❯ 5. [✔]
+     Submit
+────────────────────────────────
+  6. Chat about this
+Enter to select · ↑/↓ to navigate · ctrl+g to
+edit in Nvim · Esc to cancel"""
+
+    def test_a_wrapped_footer_still_says_the_text_field_has_focus(self):
+        """The literal breaks mid-phrase at 46 columns; an unnormalised `in` misses it."""
+        with loaded_relay() as relay:
+            self.assertTrue(relay.custom_editor_active(self.TYPING))
+            message = relay.blocked_message("pane-1", "claude", "project", "local", self.TYPING)
+            self.assertTrue(message["text_field"])
+
+    def test_a_toggle_is_refused_on_that_wrapped_screen_too(self):
+        """The guard is only worth having if it survives the width the panes actually are."""
+        with loaded_relay() as relay:
+            with mock.patch.object(relay, "pane_is_omp", return_value=False), \
+                 mock.patch.object(relay, "read_pane", return_value=self.TYPING), \
+                 mock.patch.object(relay, "_mutate_herdr") as mutate:
+                self.assertFalse(relay.toggle_question_option("pane-1", "Push"))
+
+            mutate.assert_not_called()
+
+    def test_an_empty_label_row_is_not_an_option(self):
+        """Row 5 loses its text once it becomes the input; it must not become a blank chip."""
+        with loaded_relay() as relay:
+            self.assertEqual(
+                [row["label"] for row in relay.detect_checkbox_options(self.TYPING)],
+                ["Push", "Widgets", "Telegram", "Watch"],
+            )
+
+    # An agent that printed its OWN numbered checklist, above a live question. Seven rows, so a
+    # reader taking max() over the screen lands on row 7 -- a line of the checklist -- instead of
+    # the menu's own free-text row.
+    CHECKLIST_ABOVE = """Here is the plan I drew up earlier:
+
+  1. [x] read the config
+  2. [x] parse the flags
+  3. [ ] wire the reader
+  4. [ ] add the tests
+  5. [ ] update the docs
+  6. [ ] ship it
+  7. [ ] write the changelog
+
+Now, a question:
+
+←  ☐ Caps  ✔ Submit  →
+Which capabilities?
+  1. [ ] Color output
+  Use ANSI colors in rendered output.
+  2. [ ] Nerd Font
+  Assume a Nerd Font is installed.
+❯ 3. [✔] and dark mode please
+     Submit
+  4. Chat about this
+Enter to select · ↑/↓ to navigate · Esc to cancel"""
+
+    def test_output_above_the_menu_cannot_move_the_free_text_row(self):
+        """Every reader takes the last RUN, so a printed checklist above cannot capture them.
+
+        These four disagreeing is not hypothetical: three of them took max() over the whole
+        screen, so this screen put the free-text row at 7 while the options read 1..3. The card
+        then stayed on its options branch (digits typed into the answer), Submit pressed Right
+        from inside the input, and the text was walked six rows down a four-row menu.
+        """
+        with loaded_relay() as relay:
+            self.assertEqual(
+                [row["number"] for row in relay.detect_checkbox_options(self.CHECKLIST_ABOVE)],
+                [1, 2, 3],
+            )
+            self.assertEqual(relay.free_text_row_number(self.CHECKLIST_ABOVE), 3)
+            self.assertEqual(relay.free_text_value(self.CHECKLIST_ABOVE), "and dark mode please")
+            self.assertTrue(relay.checkbox_field_focused(self.CHECKLIST_ABOVE))
+
+    def test_that_screen_types_into_the_menu_and_not_into_the_checklist(self):
+        """The end of the same story: the row it walks to, and how far it walks."""
+        with loaded_relay() as relay:
+            message = relay.blocked_message(
+                "pane-1", "claude", "project", "local", self.CHECKLIST_ABOVE
+            )
+            self.assertTrue(message["text_field"])
+            self.assertEqual(message["text_value"], "and dark mode please")
+            with mock.patch.object(relay, "read_pane", return_value=self.CHECKLIST_ABOVE), \
+                 mock.patch.object(relay, "_mutate_herdr", return_value=True) as mutate:
+                self.assertTrue(relay.deliver_checkbox_free_text("pane-1", "dark mode", None))
+
+            # Cursor already on the row: no tick, no walk, just the backspaces and the text.
+            self.assertEqual(
+                [call.args[1] for call in mutate.call_args_list], ["send-keys", "send-text"]
+            )
+            self.assertEqual(
+                mutate.call_args_list[0].args[3:],
+                tuple(["Backspace"] * len("and dark mode please")),
+            )
+
+    # Captured verbatim off the live pane, with the free-text row TICKED and the cursor parked on
+    # "Chat about this". The footer advertises ctrl+g here even though nothing has focus -- which
+    # is exactly what made custom_editor_active() the wrong test for this menu.
+    TICKED_ELSEWHERE = """Which features?
+  1. [✔] Push
+  Push notifications
+  2. [✔] Widgets
+  Home screen widgets
+  3. [ ] Telegram
+  Telegram integration
+  4. [ ] Watch
+  Watch app support
+  5. [✔] Type something
+     Submit
+──────────────────────────────
+❯ 6. Chat about this
+Enter to select · ↑/↓ to navigate · ctrl+g to
+edit in Nvim · Esc to cancel"""
+
+    # Same screen, cursor moved onto the free-text row. Note it KEEPS its label here, which is why
+    # focus is read off the cursor rather than off an empty label.
+    FIELD_FOCUSED = TICKED_ELSEWHERE.replace(
+        "  5. [✔] Type something", "❯ 5. [✔] Type something"
+    ).replace("❯ 6. Chat about this", "  6. Chat about this")
+
+    # What a --source visible read returns once claude's own viewport has scrolled off the menu.
+    SCROLLED_AWAY = """❯ Use AskUserQuestion with multiSelect true.
+  header 'Feat', question 'Which features?'.
+─────────────── 1 new message (ctrl+End) ↓ ────────
+←  ☐ Feat  ✔ Submit  →
+Which features?"""
+
+    def test_a_ticked_free_text_row_does_not_hide_the_checkboxes(self):
+        """The reported bug: tapping "Type something" emptied the dock with no way back."""
+        with loaded_relay() as relay:
+            # The old test, kept as the reason this needed its own signal at all.
+            self.assertTrue(relay.custom_editor_active(self.TICKED_ELSEWHERE))
+            self.assertFalse(relay.checkbox_field_focused(self.TICKED_ELSEWHERE))
+
+            message = relay.blocked_message(
+                "pane-1", "claude", "project", "local", self.TICKED_ELSEWHERE
+            )
+            self.assertFalse(message["text_field"])
+            self.assertEqual(len(message["multi_options"]), 5)
+            self.assertEqual(
+                message["selected_options"], ["Push", "Widgets", "Type something"]
+            )
+
+    def test_the_cursor_on_the_free_text_row_is_typing_mode(self):
+        with loaded_relay() as relay:
+            self.assertTrue(relay.checkbox_field_focused(self.FIELD_FOCUSED))
+            message = relay.blocked_message(
+                "pane-1", "claude", "project", "local", self.FIELD_FOCUSED
+            )
+            self.assertTrue(message["text_field"])
+
+    def test_a_toggle_is_refused_only_while_the_input_has_focus(self):
+        """Refusing on the ticked-but-unfocused screen would kill the menu for good."""
+        with loaded_relay() as relay:
+            with mock.patch.object(relay, "pane_is_omp", return_value=False), \
+                 mock.patch.object(relay, "read_pane", return_value=self.FIELD_FOCUSED), \
+                 mock.patch.object(relay, "_mutate_herdr") as mutate:
+                self.assertFalse(relay.toggle_question_option("pane-1", "Push"))
+            mutate.assert_not_called()
+
+            with mock.patch.object(relay, "pane_is_omp", return_value=False), \
+                 mock.patch.object(relay, "read_pane", return_value=self.TICKED_ELSEWHERE), \
+                 mock.patch.object(relay, "_mutate_herdr", return_value=True) as mutate:
+                self.assertTrue(relay.toggle_question_option("pane-1", "Push"))
+            mutate.assert_called_once_with("pane", "send-keys", "pane-1", "1", remote=None)
+
+    def test_the_free_text_row_is_not_in_the_prompt_id(self):
+        """Choosing it deletes its own label; an id over the labels would move as you type."""
+        without_label = self.TICKED_ELSEWHERE.replace("5. [✔] Type something", "5. [✔]")
+        with loaded_relay() as relay:
+            self.assertEqual(
+                relay.question_prompt_id("pane-1", self.TICKED_ELSEWHERE),
+                relay.question_prompt_id("pane-1", without_label),
+            )
+
+    def test_a_scrolled_away_menu_is_revealed_rather_than_called_a_changed_question(self):
+        """A --source visible read past a scrolled viewport has no menu on it at all."""
+        with loaded_relay() as relay:
+            self.assertTrue(relay.pane_scrolled_away(self.SCROLLED_AWAY))
+            self.assertEqual(relay.detect_checkbox_options(self.SCROLLED_AWAY), [])
+
+            with mock.patch.object(relay, "pane_is_omp", return_value=False), \
+                 mock.patch.object(
+                     relay, "read_pane",
+                     side_effect=[self.SCROLLED_AWAY, self.MENU, self.MENU],
+                 ), mock.patch.object(relay, "_mutate_herdr", return_value=True) as mutate:
+                self.assertTrue(relay.toggle_question_option("pane-1", "Nerd Font"))
+
+            keys = [call.args[3] for call in mutate.call_args_list]
+            # ctrl+End goes out as CSI bytes through send-text, then the row's own digit.
+            self.assertEqual(keys[-1], "2")
+            self.assertIn("send-text", [call.args[1] for call in mutate.call_args_list])
+
+    def test_a_wrapped_scroll_indicator_is_still_recognised(self):
+        with loaded_relay() as relay:
+            self.assertTrue(relay.pane_scrolled_away("Jump to bottom\n(ctrl+End) \u2193"))
+            self.assertFalse(relay.pane_scrolled_away(self.MENU))
+
+    def test_the_cursor_row_and_the_free_text_row_are_found(self):
+        with loaded_relay() as relay:
+            self.assertEqual(relay.menu_cursor_row(self.MENU), 1)
+            self.assertEqual(relay.menu_cursor_row(self.FIELD_FOCUSED), 5)
+            self.assertEqual(relay.menu_cursor_row(self.TICKED_ELSEWHERE), 6)
+            # The last CHECKBOX row, not the last numbered one: "Chat about this" has no box.
+            self.assertEqual(relay.free_text_row_number(self.MENU), 5)
+
+    def test_tapping_the_free_text_row_walks_the_cursor_onto_it(self):
+        """Its digit only ticks the box; the input opens when the CURSOR arrives.
+
+        Measured before this: tapping "Type something" left the cursor on row 1, no field open,
+        custom_editor_active False -- a lit button, no text box, and a Send the relay then
+        refused with "free-text response requires a detected question".
+        """
+        with loaded_relay() as relay:
+            with mock.patch.object(relay, "pane_is_omp", return_value=False), \
+                 mock.patch.object(relay, "read_pane", return_value=self.MENU), \
+                 mock.patch.object(relay, "_mutate_herdr", return_value=True) as mutate:
+                self.assertTrue(relay.toggle_question_option("pane-1", "Type something"))
+
+            # The digit ticks the box (which is what makes the typed answer count), then the
+            # cursor walks onto the row, which is what opens the input. Tick first: a digit
+            # pressed while the input has focus would be typed into it.
+            self.assertEqual(
+                mutate.call_args_list,
+                [
+                    mock.call("pane", "send-keys", "pane-1", "5", remote=None),
+                    mock.call("pane", "send-keys", "pane-1",
+                              "Down", "Down", "Down", "Down", remote=None),
+                ],
+            )
+
+    def test_an_ordinary_option_still_takes_its_digit(self):
+        with loaded_relay() as relay:
+            with mock.patch.object(relay, "pane_is_omp", return_value=False), \
+                 mock.patch.object(relay, "read_pane", return_value=self.MENU), \
+                 mock.patch.object(relay, "_mutate_herdr", return_value=True) as mutate:
+                relay.toggle_question_option("pane-1", "Mobile layout")
+            mutate.assert_called_once_with("pane", "send-keys", "pane-1", "3", remote=None)
+
+    def test_free_text_focuses_the_input_before_typing(self):
+        with loaded_relay() as relay:
+            with mock.patch.object(relay, "read_pane", return_value=self.MENU), \
+                 mock.patch.object(relay, "_mutate_herdr", return_value=True) as mutate:
+                self.assertTrue(
+                    relay.deliver_checkbox_free_text("pane-1", "mobile layout only")
+                )
+            # No trailing Enter: Enter on this row toggles its checkbox, which would leave the
+            # answer typed and the option unselected.
+            self.assertEqual(
+                mutate.call_args_list,
+                [
+                    mock.call("pane", "send-keys", "pane-1", "5", remote=None),
+                    mock.call("pane", "send-keys", "pane-1",
+                              "Down", "Down", "Down", "Down", remote=None),
+                    mock.call("pane", "send-text", "pane-1", "mobile layout only", remote=None),
+                ],
+            )
+
+    def test_free_text_on_an_already_focused_input_does_not_move_the_cursor(self):
+        with loaded_relay() as relay:
+            with mock.patch.object(relay, "read_pane", return_value=self.FIELD_FOCUSED), \
+                 mock.patch.object(relay, "_mutate_herdr", return_value=True) as mutate:
+                self.assertTrue(relay.deliver_checkbox_free_text("pane-1", "hello"))
+            self.assertEqual(
+                [call.args[1] for call in mutate.call_args_list], ["send-text"]
+            )
+
+    TYPED = FIELD_FOCUSED.replace(
+        "\u276f 5. [\u2714] Type something", "\u276f 5. [\u2714] helo wrld"
+    )
+
+    def test_the_placeholder_is_not_an_answer(self):
+        with loaded_relay() as relay:
+            self.assertEqual(relay.free_text_value(self.MENU), "")
+            self.assertEqual(relay.free_text_value(self.TYPED), "helo wrld")
+
+    def test_the_card_reports_what_is_already_typed(self):
+        """A reply box that silently overwrites something the reader cannot see is a trap."""
+        with loaded_relay() as relay:
+            self.assertEqual(
+                relay.blocked_message("p", "claude", "x", "local", self.TYPED)["text_value"],
+                "helo wrld",
+            )
+            self.assertEqual(
+                relay.blocked_message("p", "claude", "x", "local", self.MENU)["text_value"], ""
+            )
+
+    def test_sending_again_replaces_the_answer_rather_than_appending(self):
+        """`pane send-text` appends: measured, "helo" then "XYZ" became "helo XYZ", so a typo
+        made on a phone could not be corrected at all."""
+        with loaded_relay() as relay:
+            with mock.patch.object(relay, "read_pane", return_value=self.TYPED), \
+                 mock.patch.object(relay, "_mutate_herdr", return_value=True) as mutate:
+                self.assertTrue(relay.deliver_checkbox_free_text("pane-1", "hello world"))
+
+            calls = mutate.call_args_list
+            self.assertEqual(
+                calls[0],
+                mock.call("pane", "send-keys", "pane-1",
+                          *(["Backspace"] * len("helo wrld")), remote=None),
+            )
+            self.assertEqual(
+                calls[-1], mock.call("pane", "send-text", "pane-1", "hello world", remote=None)
+            )
+
+    def test_an_empty_row_is_not_backspaced(self):
+        with loaded_relay() as relay:
+            with mock.patch.object(relay, "read_pane", return_value=self.FIELD_FOCUSED), \
+                 mock.patch.object(relay, "_mutate_herdr", return_value=True) as mutate:
+                relay.deliver_checkbox_free_text("pane-1", "first answer")
+            self.assertEqual([c.args[1] for c in mutate.call_args_list], ["send-text"])
+
+    def test_submit_steps_off_the_input_and_uses_the_menus_own_submit_line(self):
+        """Right inside the input moves the text caret, not the tab; measured, submit just failed.
+
+        Down lands the cursor on the menu's own "Submit" line, and Enter there opens the review
+        screen -- which carried "Push, Watch, and dark mode please", the typed answer among the
+        ticked ones.
+        """
+        on_submit_line = self.FIELD_FOCUSED.replace(
+            "\u276f 5. [\u2714] Type something", "  5. [\u2714] and dark mode please"
+        ).replace("     Submit", "\u276f    Submit")
+        with loaded_relay() as relay:
+            with mock.patch.object(relay, "pane_is_omp", return_value=False), \
+                 mock.patch.object(
+                     relay, "read_pane",
+                     side_effect=[self.FIELD_FOCUSED, on_submit_line, self.REVIEW],
+                 ), mock.patch.object(relay, "_mutate_herdr", return_value=True) as mutate:
+                self.assertTrue(relay.submit_multi_question("pane-1"))
+
+            self.assertEqual(
+                [call.args[3] for call in mutate.call_args_list], ["Down", "Enter", "1"]
+            )
+
+    def test_a_single_select_claude_menu_is_still_an_ordinary_numbered_menu(self):
+        with loaded_relay() as relay:
+            self.assertEqual(relay.detect_checkbox_options(self.SINGLE_SELECT), [])
+            message = relay.blocked_message(
+                "pane-1", "claude", "project", "local", self.SINGLE_SELECT
+            )
+
+            self.assertEqual(message["interaction"], "numbered")
+            self.assertFalse(message["multi"])
+            self.assertEqual(message["multi_options"], [])
+            self.assertTrue(message["options"][0].startswith("Dark"))
+
+    def test_an_approval_menu_carries_no_checkbox_and_is_untouched(self):
+        approval = (
+            "Do you want to proceed?\n"
+            "❯ 1. Yes\n"
+            "  2. Yes, and always allow access to /tmp from this project\n"
+            "  3. No\n"
+            "Esc to cancel"
+        )
+        with loaded_relay() as relay:
+            self.assertEqual(relay.detect_checkbox_options(approval), [])
+            message = relay.blocked_message("pane-1", "claude", "project", "local", approval)
+
+            self.assertEqual(message["interaction"], "numbered")
+            self.assertFalse(message["multi"])
+
+    def test_a_lone_checkbox_row_in_ordinary_output_is_not_a_menu(self):
+        with loaded_relay() as relay:
+            self.assertEqual(
+                relay.detect_checkbox_options("build log\n1. [x] done\nnext step"), []
+            )
+
+    def test_an_omp_question_keeps_its_own_interaction_and_grammar(self):
+        """The omp path is untouched: it still says omp_question and still drives by cursor."""
+        with loaded_relay() as relay:
+            message = relay.blocked_message(
+                "pane-1", "omp", "project", "local", RelayQuestionTests.MULTI_SCREEN
+            )
+
+            self.assertEqual(message["interaction"], "omp_question")
+            self.assertTrue(message["multi"])
+            self.assertIn("Nerd Font", message["multi_options"])
+
+
+
+class QuestionProbeTests(unittest.TestCase):
+    """The relay deciding for itself that an "idle" pane is waiting on an answer.
+
+    herdr reads `blocked` off the dialog footer, and that footer wraps: measured on one pane and
+    one question, 103 columns answered `blocked` and 46 columns answered `idle`. A pane's width
+    follows whatever terminal is attached, so connecting from a phone is what makes it narrow --
+    the question goes unnoticed in exactly the situation a remote client is the only way to
+    answer it.
+    """
+
+    CHECKBOX = ClaudeMultiSelectMenuTests.MENU
+    # The single-select menu as a 46-column pane renders it: the footer is 49 cells, so
+    # "Esc to cancel" lands split across two lines and herdr's literal never matches.
+    WRAPPED_SINGLE = ClaudeMultiSelectMenuTests.SINGLE_SELECT
+    WORKING = "✳ Cooking… (12s · esc to interrupt)\nediting relay/herdr_relay.py"
+
+    def _agent(self, pane_id="w8:p1", status="idle", host="local"):
+        return {"pane_id": pane_id, "status": status, "host": host, "agent": "claude",
+                "project": "qtest", "remote": None}
+
+    def test_a_wrapped_footer_question_is_recognised(self):
+        with loaded_relay() as relay:
+            self.assertTrue(relay.pane_awaiting_answer(self.CHECKBOX))
+            self.assertTrue(relay.pane_awaiting_answer(self.WRAPPED_SINGLE))
+
+    # The same question on a pane wide enough to keep its footer on one line. Every other screen
+    # in this file is a narrow capture, where the footer is already split.
+    WIDE = ClaudeMultiSelectMenuTests.MENU.replace(
+        "Enter to select · ↑/↓ to navigate · Esc to\ncancel",
+        "Enter to select · ↑/↓ to navigate · Esc to cancel",
+    )
+
+    def test_the_footer_survives_read_pane_s_own_chrome_filter(self):
+        """The only test that goes through read_pane, because that is where this can break.
+
+        CHROME_RE drops any line holding `esc to cancel` -- the phrase question_footer_at_bottom
+        needs -- and the two coexist only because that pattern is case-sensitive while claude
+        writes `Esc`. Every other test here hands a screen straight to the detector, so nothing
+        would notice an re.IGNORECASE added to CHROME_RE for unrelated reasons: on a wide pane it
+        would delete the footer before the probe could read it.
+
+        It bites on a WIDE pane only, and that is worth saying precisely: on the narrow panes this
+        feature exists for, the same wrap that defeats herdr's literal defeats CHROME_RE's, so the
+        footer survives whatever its case. The exposure is a wide pane herdr has not called
+        blocked for some other reason.
+        """
+        with loaded_relay() as relay:
+            with mock.patch.object(relay, "run_herdr", return_value=self.WIDE):
+                screen = relay.read_pane("w8:p1")
+
+            self.assertIn("Esc to cancel", screen)
+            self.assertTrue(relay.pane_awaiting_answer(screen))
+            # The other half of the claim, stated so the coupling cannot be rediscovered the hard
+            # way: spell that footer in lower case and read_pane eats it.
+            lowered = self.WIDE.replace("Esc to cancel", "esc to cancel")
+            with mock.patch.object(relay, "run_herdr", return_value=lowered):
+                self.assertFalse(relay.pane_awaiting_answer(relay.read_pane("w8:p1")))
+
+    # The same menu an agent PRINTED, with its own composer and status line below it. Reported
+    # from the phone: a pane showing this was promoted to blocked and served another pane's option
+    # list, and the checkbox dock then replaced the reply box so the reader could not even type.
+    ECHOED = ClaudeMultiSelectMenuTests.MENU + """
+● That is the menu the relay parses.
+✻ Brewed for 4s · done 8:20 AM
+❯
+  alan-yu@LAPTOP-SFG14 /home/alan-yu/projects/herdr-remote
+  ⏵⏵ auto mode on (shift+tab to cycle)"""
+
+    def test_a_menu_that_is_only_output_is_not_a_question(self):
+        """A live prompt owns the bottom of its pane; a picture of one has output below it."""
+        with loaded_relay() as relay:
+            self.assertTrue(relay.pane_awaiting_answer(self.CHECKBOX))
+            self.assertFalse(relay.pane_awaiting_answer(self.ECHOED))
+            self.assertFalse(relay.question_footer_at_bottom(self.ECHOED))
+            # The rows are still perfectly readable -- shape was never the discriminator.
+            self.assertEqual(len(relay.detect_checkbox_options(self.ECHOED)), 5)
+
+    def test_such_a_pane_is_never_promoted(self):
+        with loaded_relay() as relay:
+            with mock.patch.object(relay, "read_pane", return_value=self.ECHOED):
+                self.assertEqual(relay.probe_idle_questions([self._agent()]), {})
+            self.assertEqual(relay.question_panes, {})
+
+    def test_a_wrapped_footer_still_counts_as_at_the_bottom(self):
+        """It wraps to two or three lines on a narrow pane, which is why this feature exists."""
+        with loaded_relay() as relay:
+            self.assertTrue(relay.question_footer_at_bottom(self.WRAPPED_SINGLE))
+
+    def test_ordinary_output_is_not_a_question(self):
+        with loaded_relay() as relay:
+            self.assertFalse(relay.pane_awaiting_answer(self.WORKING))
+            self.assertFalse(relay.pane_awaiting_answer("build ok\n3 files changed"))
+            # A footer alone is not a menu: "esc to cancel" appears under things you cannot answer.
+            self.assertFalse(relay.pane_awaiting_answer("Searching…\nEsc to cancel"))
+
+    def test_an_idle_pane_holding_a_question_is_read_and_reported(self):
+        with loaded_relay() as relay:
+            with mock.patch.object(relay, "read_pane", return_value=self.CHECKBOX) as read:
+                found = relay.probe_idle_questions([self._agent()])
+            read.assert_called_once()
+            self.assertEqual(list(found), [("local", "w8:p1")])
+
+    def test_a_working_or_blocked_pane_is_never_read(self):
+        """Working cannot be waiting, and blocked is already handled by the poll's own branch."""
+        with loaded_relay() as relay:
+            with mock.patch.object(relay, "read_pane") as read:
+                found = relay.probe_idle_questions([
+                    self._agent(status="working"),
+                    self._agent(pane_id="w8:p2", status="blocked"),
+                ])
+            read.assert_not_called()
+            self.assertEqual(found, {})
+
+    def test_a_quiet_idle_pane_is_not_read_every_tick(self):
+        """Every read is a herdr call, and an SSH round trip on a remote host."""
+        with loaded_relay() as relay:
+            agent = self._agent()
+            with mock.patch.object(relay, "read_pane", return_value="nothing here") as read:
+                for _ in range(relay.QUESTION_PROBE_INTERVAL):
+                    relay.probe_idle_questions([agent])
+            # Once for the status it had never seen, once for the interval sweep. Not one a tick.
+            self.assertEqual(read.call_count, 2)
+
+    def test_a_done_pane_is_probed_too(self):
+        """`pane list` reports `done` for a pane sitting on a question; `agent explain` says
+        `idle` for the same pane at the same moment, and it is `pane list` the relay ships."""
+        with loaded_relay() as relay:
+            with mock.patch.object(relay, "read_pane", return_value=self.CHECKBOX) as read:
+                found = relay.probe_idle_questions([self._agent(status="done")])
+            read.assert_called_once()
+            self.assertEqual(list(found), [("local", "w8:p1")])
+
+    def test_a_status_change_reads_immediately(self):
+        """An agent that stops working is exactly when a question appears."""
+        with loaded_relay() as relay:
+            with mock.patch.object(relay, "read_pane", return_value="nothing") as read:
+                relay.probe_idle_questions([self._agent(status="working")])
+                self.assertEqual(read.call_count, 0)
+                relay.probe_idle_questions([self._agent(status="idle")])
+                self.assertEqual(read.call_count, 1)
+
+    def test_a_pane_that_stops_holding_a_question_is_demoted(self):
+        with loaded_relay() as relay:
+            agent = self._agent()
+            with mock.patch.object(relay, "read_pane", return_value=self.CHECKBOX):
+                self.assertEqual(list(relay.probe_idle_questions([agent])), [("local", "w8:p1")])
+            with mock.patch.object(relay, "read_pane", return_value="answered, carry on"):
+                self.assertEqual(relay.probe_idle_questions([agent]), {})
+            self.assertEqual(relay.question_panes, {})
+
+    def test_a_pane_holding_a_question_is_re_read_every_tick(self):
+        """Its content is what the blocked card is rendered from, so it may not go stale."""
+        with loaded_relay() as relay:
+            agent = self._agent()
+            with mock.patch.object(relay, "read_pane", return_value=self.CHECKBOX) as read:
+                for _ in range(3):
+                    relay.probe_idle_questions([agent])
+            self.assertEqual(read.call_count, 3)
+
+    def test_a_connecting_client_is_told_about_a_question_already_found(self):
+        """Otherwise the card waits for a change, and a question sitting still never makes one."""
+        with loaded_relay() as relay:
+            agent = self._agent()
+            with mock.patch.object(relay, "read_pane", return_value=self.CHECKBOX):
+                relay.probe_idle_questions([agent])
+            ws = _FakeWebSocket([])
+            with mock.patch.object(relay, "get_all_panes", return_value=([dict(agent)], [])), \
+                 mock.patch.object(relay, "refresh_spaces", return_value={}), \
+                 mock.patch.object(relay, "sessions_message", return_value={"type": "sessions"}), \
+                 mock.patch.object(relay, "read_pane", return_value=self.CHECKBOX):
+                asyncio.run(relay.send_current_snapshot(ws))
+
+            sent = [json.loads(m) for m in ws.sent]
+            snapshot = next(m for m in sent if m.get("type") == "agents")
+            self.assertEqual(snapshot["agents"][0]["status"], "blocked")
+            card = next(m for m in sent if m.get("type") == "blocked")
+            self.assertEqual(card["interaction"], "multi_question")
+
+    def test_a_vanished_pane_is_forgotten(self):
+        with loaded_relay() as relay:
+            with mock.patch.object(relay, "read_pane", return_value=self.CHECKBOX):
+                relay.probe_idle_questions([self._agent()])
+            self.assertTrue(relay.question_panes)
+            relay.probe_idle_questions([])
+            self.assertEqual(relay.question_panes, {})
+            self.assertEqual(relay.question_probe_status, {})
+
+    def test_the_probe_can_be_switched_off(self):
+        with loaded_relay() as relay:
+            relay.QUESTION_PROBE = False
+            with mock.patch.object(relay, "read_pane") as read:
+                self.assertEqual(relay.probe_idle_questions([self._agent()]), {})
+            read.assert_not_called()
+
+    def test_two_hosts_with_the_same_pane_id_do_not_collide(self):
+        with loaded_relay() as relay:
+            panes = [self._agent(host="local"), self._agent(host="build-box")]
+            with mock.patch.object(relay, "read_pane", side_effect=[self.CHECKBOX, "idle output"]):
+                found = relay.probe_idle_questions(panes)
+            self.assertEqual(list(found), [("local", "w8:p1")])
+
 
 
 if __name__ == "__main__":

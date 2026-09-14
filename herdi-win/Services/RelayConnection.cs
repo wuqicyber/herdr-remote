@@ -533,11 +533,11 @@ public sealed class RelayConnection : INotifyPropertyChanged, IDisposable
     }
 
     /// <summary>
-    /// Toggle one option of a multi-select question. NOTE: the current relay has no
-    /// handler for `question_toggle` — herdi-mac, herdi-ios, the web app and the TUI
-    /// all send it and it is silently ignored. Kept for parity so this client works
-    /// the moment the relay grows support. Relay mode only, as on macOS: multi-select is a
-    /// relay-protocol notion with no herdr CLI verb behind it.
+    /// Toggle one option of a multi-select question. The option travels as its LABEL: the
+    /// relay resolves it against the live screen and presses whatever that menu wants — a
+    /// row's own digit for claude's numbered checkbox menu, a cursor walk for omp's. A stale
+    /// PromptId comes back as an error rather than toggling the wrong row. Relay mode only,
+    /// as on macOS: multi-select is a relay-protocol notion with no herdr CLI verb behind it.
     /// </summary>
     public void ToggleQuestionOption(Agent agent, string option)
     {

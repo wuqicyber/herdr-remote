@@ -78,7 +78,9 @@ class ApprovalPanel(Vertical):
     def compose(self) -> ComposeResult:
         prompt = self.agent.get("prompt", "Waiting for input...")
         yield Static(prompt[:400], classes="prompt-text")
-        multi = self.agent.get("interaction") == "omp_question" and self.agent.get("multi")
+        # Both multi-select interactions: omp's arrow-key question grammar and the numbered
+        # checkbox menu (claude's multiSelect). Same protocol shape, different keys behind it.
+        multi = self.agent.get("interaction") in {"omp_question", "multi_question"} and self.agent.get("multi")
         options = self.agent.get("multi_options") if multi else self.agent.get("options")
         options = options or []
         selected = set(self.agent.get("selected_options") or [])

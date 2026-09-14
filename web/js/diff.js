@@ -47,6 +47,13 @@ function handleMessage(msg) {
     // perceptible at least as a cue. The buttons themselves come back on the next blocked
     // broadcast, since the pane is still blocked.
     if (window.cue) cue('error');
+    // A question refusal is attributable -- the relay names the scope, the pane and the option --
+    // so it can be shown against the control that caused it instead of only being heard. The
+    // relay re-broadcasts the pane's real state straight after, and that rebuild is what draws
+    // this; nothing here needs to touch the DOM.
+    if (msg.scope === 'question_toggle' || msg.scope === 'question_submit') {
+      questionError = {pane_id: msg.pane_id, option: msg.option || '', message: msg.message || '', at: Date.now()};
+    }
     switchingSession = false;
     render();
     return;
@@ -74,6 +81,8 @@ function handleMessage(msg) {
         options: previous.options,
         multi_options: previous.multi_options,
         interaction: previous.interaction,
+        text_field: previous.text_field,
+        text_value: previous.text_value,
         multi: previous.multi,
         prompt_id: previous.prompt_id,
         selected_options: previous.selected_options,
@@ -105,10 +114,16 @@ function handleMessage(msg) {
       a.selected_options=msg.selected_options||[];
       a.multi_options=msg.multi_options||[];
       a.interaction=msg.interaction;
+      a.text_field=!!msg.text_field;
+      a.text_value=msg.text_value||'';
       a.multi=msg.multi;
     }
     else agents.push({...msg, status:'blocked'});
-    if(window.cue) cue('chime');
+    // Only for a block the reader has not been told about. `update` marks a re-broadcast of a
+    // pane already announced -- which now includes the one the relay sends after every toggle, so
+    // an unguarded chime sounded the agent-needs-you alert on each of the reader's own taps. The
+    // same flag already gates the timeline entry below and the web push on the relay's side.
+    if(window.cue && !msg.update) cue('chime');
     if (!msg.update) {
       timeline.unshift({project: msg.project, agent: msg.agent, status: 'blocked', time: new Date()});
       if (timeline.length > 100) timeline.pop();
