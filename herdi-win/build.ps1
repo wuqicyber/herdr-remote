@@ -49,7 +49,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$version = '0.8.0'
+$version = '0.8.1'
 $distDir = Join-Path $scriptDir 'dist'
 $outDir = Join-Path $distDir $Arch
 
