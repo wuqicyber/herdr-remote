@@ -1,0 +1,27 @@
+herdi-mac/build.sh
+  s_7232668bb251c3::t_dc19918d77f537 7
+herdi-win/Herdi.Win.csproj
+  s_7232668bb251c3::t_f161cf735f777f 20-22
+herdi-win/build.ps1
+  s_7232668bb251c3::t_2feadf516c93be 52
+herdr-plugin.toml
+  s_7232668bb251c3::t_a5e94f46ddbdd4 3
+relay/herdr-plugin.toml
+  s_7232668bb251c3::t_32431c7970d9ac 3
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "0bf26107199b9c7247c2a403ff2f41bb90b07431",
+  "prompts": {},
+  "sessions": {
+    "s_7232668bb251c3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "0fd2e871-a686-4e15-8665-683429e1a119",
+        "model": "claude-opus-5"
+      },
+      "human_author": "eleanor.zhu <eleanore.zhu@gmail.com>"
+    }
+  }
+}
