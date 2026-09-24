@@ -412,6 +412,8 @@ body { font-family: var(--font-mono); background: var(--bg); color: var(--text);
 .qa-hint { flex: 1 1 100%; padding: 8px 12px; border-radius: 8px; font-size: 0.8rem; font-weight: 600; text-align: center; color: var(--muted); border: 1px dashed var(--border); }
 /* A refused toggle. Solid rather than dashed, and in the red the "no" answers already own, so it
    reads as something that happened rather than as another waiting-for-you hint beside it. */
+.send-error { margin: 4px 8px 0; }
+.send-error[hidden] { display: none; }
 .qa-error { color: var(--red); border-style: solid; border-color: color-mix(in oklab, var(--red) 45%, transparent); }
 .btn-yes { background: var(--green); color: var(--on-accent); } .btn-trust { background: var(--blue); color: var(--on-accent); } .btn-no { background: var(--red); color: var(--on-accent); }
 .term-input { border-top: 1px solid var(--border); padding: 5px 10px; display: flex; gap: 5px; background: var(--surface); flex-shrink: 0; }
