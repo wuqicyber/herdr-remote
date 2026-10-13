@@ -796,8 +796,8 @@ def _invoke_herdr(*args, remote=None):
         cmd = ["ssh", *SSH_BASE_ARGS, remote]
         if session:
             # An env= would not survive ssh; the remote shell applies this.
-            cmd.append(f"HERDR_SESSION={session}")
-        cmd += [REMOTE_HERDR, *args]
+            cmd.append(f"HERDR_SESSION={shlex.quote(session)}")
+        cmd += [REMOTE_HERDR, *(shlex.quote(str(arg)) for arg in args)]
         with _remote_lock(remote):
             return subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15)
 
@@ -983,7 +983,10 @@ def list_panes_from_host(remote=None):
 
     agents, shells = [], []
     for order, p in enumerate(panes):
-        if not p.get("agent"):
+        if not p.get("agent") and not (
+            isinstance(p.get("agent_session"), dict)
+            and p["agent_session"].get("agent")
+        ):
             if SHELL_PANES and p.get("pane_id"):
                 shells.append(shell_pane_record(p, host_label, remote, order))
             continue
@@ -1000,7 +1003,8 @@ def list_panes_from_host(remote=None):
         scroll = p.get("scroll") or {}
         agents.append({
             "pane_id": p["pane_id"],
-            "agent": p.get("agent", ""),
+            "agent": p.get("agent")
+                or (p.get("agent_session") or {}).get("agent", ""),
             # The agent's name first, the pane's label second. herdr keeps the two apart and
             # `pane list` only carries the latter, which nothing sets by default -- so this field
             # was empty for every agent on the host and clients fell back to the pane id.
