@@ -1,0 +1,27 @@
+relay/herdr_relay.py
+  s_a6307211f7c3e9::t_7b1a5ff657325a 799-800,986-989,1006-1007
+relay/transcript.py
+  s_a6307211f7c3e9::t_ae9699ed7727bd 11-14,17,31-36,80-82,567-686,863-865,867-869,886-888,899-901
+tests/test_herdr_relay.py
+  s_a6307211f7c3e9::t_d778944cef59ad 3132-3171
+tests/test_transcript.py
+  s_a6307211f7c3e9::t_953416894aa6f9 712-862
+web/app.css
+  s_a6307211f7c3e9::t_b2191f19ead441 505-512
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "f5cf89e7b6c5ad272bd36f9f3ae8776733e3c340",
+  "prompts": {},
+  "sessions": {
+    "s_a6307211f7c3e9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f25d8872-41d2-4322-9d3d-5e1336db5ca3",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "eleanor.zhu <eleanore.zhu@gmail.com>"
+    }
+  }
+}
