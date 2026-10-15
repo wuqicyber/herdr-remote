@@ -1,0 +1,22 @@
+herdi-mac/build.sh
+  h_0cc3b7d7475c37 7
+herdi-win/Herdi.Win.csproj
+  h_0cc3b7d7475c37 20-22
+herdi-win/build.ps1
+  h_0cc3b7d7475c37 52
+herdr-plugin.toml
+  h_0cc3b7d7475c37 3
+relay/herdr-plugin.toml
+  h_0cc3b7d7475c37 3
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "e388518c2d9c707bc437ddd9d9303b62c524a492",
+  "prompts": {},
+  "humans": {
+    "h_0cc3b7d7475c37": {
+      "author": "eleanor.zhu <eleanore.zhu@gmail.com>"
+    }
+  }
+}
